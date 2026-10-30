@@ -11,35 +11,75 @@ round N:  safety ─┐
                               fixer: exact-string edits ─► run checks ─► round N+1
 ```
 
+## Requirements
+
+- Python 3.12+ and [uv](https://docs.astral.sh/uv/getting-started/installation/)
+- git (it reviews the diff of a git repository)
+- [Claude Code](https://code.claude.com), installed and logged in (`claude` on your PATH). Alternatively, an Anthropic API key with `--backend api`.
+
 ## Install
 
 ```bash
-uv tool install --editable ~/personal/review-loop   # puts `reviewloop` in ~/.local/bin
+uv tool install git+https://github.com/LorinczDaniel/reviewloop.git
 ```
 
-Because the install is editable, changes to the code or the prompts take effect immediately. Uninstall with `uv tool uninstall reviewloop`.
+This puts the `reviewloop` command in `~/.local/bin`. If the command isn't found afterwards, run `uv tool update-shell` and open a new terminal.
+
+Update with `uv tool upgrade reviewloop`, and uninstall with `uv tool uninstall reviewloop`.
+
+To hack on it, clone the repo and install it as editable, so changes to the code or prompts take effect right away:
+
+```bash
+git clone git@github.com:LorinczDaniel/reviewloop.git
+uv tool install --editable ./reviewloop
+```
 
 ## Usage
 
-Runs on your Claude Code login by default (each agent is a headless `claude -p` call), so no API key is needed. Use `--backend api` to call the Anthropic API directly with `ANTHROPIC_API_KEY` instead.
+Run it from inside the git repository you want reviewed. By default it reviews your uncommitted changes (tracked and new files) against `HEAD`.
 
 ```bash
 cd /path/to/your/repo
 
-# review uncommitted changes, auto-fix, require tests + lint to pass
+# review only: report findings without touching any files (a good first run)
+reviewloop --no-fix
+
+# full loop: review, fix, re-review; tests and lint must pass to approve
 reviewloop --check "pytest -q" --check "ruff check ."
 
-# review a branch against main, report only
-reviewloop --base main --no-fix
+# review everything on your branch compared to main
+reviewloop --base main
+
+# quicker and cheaper
+reviewloop --fast
 ```
 
-`--fast` uses Claude Sonnet 5.5 at medium effort instead of Claude Opus 5.5 at high. It's much quicker and is fine for day-to-day changes; for anything security-sensitive, use the default.
+Before the fixer edits anything, it asks for confirmation (skip that with `-y`). The original of every file it touches is saved under `.reviewloop/backup/`, and `git diff` shows what changed.
 
-`--explore` gives reviewers read-only `Read`/`Grep`/`Glob` access to the whole repo, so they can follow callers and definitions outside the diff. It's slower and costs more, but catches issues that depend on surrounding code.
+When it finishes, the report is in `<repo>/.reviewloop/report.md` (with `report.json` next to it). The `.reviewloop` folder ignores itself, so it never shows up in your git status.
 
-Exit codes: `0` approved / nothing to review / report-only, `1` not converged, `2` usage error.
+By default each agent is a headless `claude -p` call on your Claude Code login, so you don't need an API key. Usage counts against your Claude plan. To use the Anthropic API instead, pass `--backend api` and set `ANTHROPIC_API_KEY`.
 
-The report goes to `<repo>/.reviewloop/report.md` (with `report.json` next to it). Before the fixer first touches a file, the original is saved under `.reviewloop/backup/`.
+### Options
+
+| Option | Default | What it does |
+|---|---|---|
+| `--base REF` | `HEAD` | Review changes against this git ref, e.g. `main` |
+| `--no-fix` | off | One review pass and a report; no files are changed |
+| `--check CMD` | none | Command that must pass before approval, e.g. `"pytest -q"`. Repeatable |
+| `--max-rounds N` | `4` | Stop and hand back to you after N rounds |
+| `--block LIST` | `blocker,major` | Severities that block approval |
+| `--fast` | off | Claude Sonnet 5.5 at medium effort instead of Claude Opus 5.5 at high. Quicker; use the default for security-sensitive code |
+| `--model`, `--effort` | `claude-opus-5-5`, `high` | Choose the model and effort directly |
+| `--explore` | off | Reviewers can read and grep the whole repo, not just the diff. Slower, but catches issues in surrounding code |
+| `--reviewers LIST` | all | Run only some reviewers, e.g. `safety,security` |
+| `--reviewer-dir DIR` | none | Add your own reviewers (see below) |
+| `--backend` | `claude-code` | `claude-code` or `api` |
+| `--repo PATH` | current directory | Repository to review |
+| `--out DIR` | `<repo>/.reviewloop` | Where reports and backups go |
+| `-y`, `--yes` | off | Don't ask before the fixer edits files |
+
+Exit codes: `0` approved, nothing to review, or report-only; `1` not converged (blocking findings remain); `2` usage error. This lets you use it in scripts or CI, e.g. `reviewloop -y --check "pytest -q" && git commit`.
 
 ## How it converges
 
