@@ -1,0 +1,24 @@
+[project]
+name = "reviewloop"
+version = "0.1.0"
+description = "Multi-reviewer code review loop powered by Claude"
+readme = "README.md"
+authors = [
+    { name = "Daniel Lorincz" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=2.3.0",
+]
+
+[project.scripts]
+reviewloop = "reviewloop.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.14,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
