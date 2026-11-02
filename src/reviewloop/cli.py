@@ -97,8 +97,13 @@ def main(argv=None) -> int:
     if args.explore and args.backend != "claude-code":
         print("warning: --explore only works with --backend claude-code; ignoring", file=sys.stderr)
     print(f"Model: {model} (effort {effort}) via {args.backend}")
+    try:
+        loop = ReviewLoop(cfg, llm, reviewers)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     start = time.monotonic()
-    outcome = ReviewLoop(cfg, llm, reviewers).run()
+    outcome = loop.run()
     minutes, seconds = divmod(int(time.monotonic() - start), 60)
 
     path = report.write(outcome, out_dir, llm.usage)

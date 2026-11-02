@@ -106,6 +106,19 @@ The overseer never runs in this mode. If a later round finds something new, you'
 
 Pressing Ctrl-C or Ctrl-D at a prompt stops the run with exit code `1`. The fixer doesn't run that round, and the report keeps the findings and the decisions you've made.
 
+## Suppressions
+
+When the overseer closes a finding as `wont_fix`, or you mark one as a false positive in triage, the decision is saved to `.reviewloop/suppressions.json`, so later runs don't raise it again. Skipped findings aren't saved, because skipping only means not now. If you pass `--out`, the file lives in that directory instead.
+
+Later runs use the file in two ways:
+
+- **Reviewers are told.** Each reviewer gets its own earlier dismissals for the files under review, and is asked not to report them again unless the code has changed so that the reason no longer holds.
+- **Exact repeats are filtered.** If a reviewer still reports a finding it reported before, with the same title on the same file and the flagged line unchanged, the finding is marked suppressed. It doesn't block approval or prompt you, but the report still lists it.
+
+Filtering doesn't look at severity, so a blocker can be suppressed too. That includes a blocker the overseer closed as `wont_fix`. Each entry records `decided_by`, `severity` and `reason`, so you can check them. To bring a finding back, delete its entry; to start over, delete the file. If the file is malformed, the run stops with exit code `2` before any review starts, and the file isn't changed.
+
+The file is per clone, because `.reviewloop` ignores itself in git.
+
 ## Custom reviewers
 
 Put `<name>.md` files in a directory and pass `--reviewer-dir DIR`. Each file describes that reviewer's area; the shared rules in `src/reviewloop/prompts/reviewer_base.md` are prepended automatically. Use `--reviewers safety,security` to run only some of them.

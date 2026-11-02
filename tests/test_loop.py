@@ -1,12 +1,13 @@
 """End-to-end loop tests against a throwaway git repo, with a scripted fake LLM."""
 
 import io
+import json
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from reviewloop import cli, report
+from reviewloop import cli, report, suppressions
 from reviewloop.edits import apply_edits
 from reviewloop.llm import Usage
 from reviewloop.loop import Config, ReviewLoop, load_reviewers
@@ -220,6 +221,157 @@ def test_closed_findings_reach_reviewers_and_report(repo):
     text = report.write(outcome, repo / ".reviewloop", Usage()).read_text()
     assert "## False positive (you) (1)" in text
     assert "you marked false positive" in text
+
+
+def suppressions_file(repo):
+    return repo / ".reviewloop" / suppressions.FILENAME
+
+
+def saved(repo):
+    return json.loads(suppressions_file(repo).read_text())["suppressions"]
+
+
+def suppressed_block(prompt):
+    if "<suppressed_findings>" not in prompt:
+        return ""
+    return prompt.split("<suppressed_findings>")[1].split("</suppressed_findings>")[0]
+
+
+class WontFixLLM(TriageLLM):
+    """Overseer closes SEC-1 as wont_fix, instead of failing the test like TriageLLM."""
+
+    def structured(self, system, user, schema, tools=None):
+        if schema is OVERSEER_SCHEMA:
+            return {"summary": "", "decisions": [
+                {"id": "SEC-1", "action": "wont_fix", "reason": "ORM escapes it", "guidance": ""}]}
+        return super().structured(system, user, schema, tools)
+
+
+def test_false_positive_is_not_raised_again_on_next_run(repo):
+    assert triage(repo, TriageLLM(), "p").findings["SEC-1"].status == "false_positive"
+    entry = saved(repo)[0]
+    assert (entry["reviewer"], entry["file"], entry["decided_by"]) == ("security", "app.py", "you")
+
+    # scripted() raises IndexError if the second run prompts.
+    llm = TriageLLM()
+    outcome = triage(repo, llm)
+    assert outcome.status == "approved"
+    assert outcome.findings["SEC-1"].status == "suppressed"
+    assert "SQL injection via name" in suppressed_block(llm.review_prompts[0])
+    text = report.write(outcome, repo / ".reviewloop", Usage()).read_text()
+    assert "## Suppressed (dismissed in an earlier decision) (1)" in text
+    assert "marked false positive in triage" in text
+
+
+def test_overseer_wont_fix_is_suppressed_on_next_run(repo):
+    run(repo, WontFixLLM())
+    assert saved(repo)[0]["decided_by"] == "overseer"
+    assert saved(repo)[0]["reason"] == "ORM escapes it"
+
+    outcome = run(repo, TriageLLM())  # would fail the test if the overseer ran
+    assert outcome.status == "approved"
+    assert outcome.findings["SEC-1"].status == "suppressed"
+
+
+def test_skip_is_not_saved(repo):
+    triage(repo, TriageLLM(), "s")
+    assert not suppressions_file(repo).exists()
+
+
+def test_changed_code_is_not_filtered(repo):
+    triage(repo, TriageLLM(), "p")
+    (repo / "app.py").write_text(BUGGY.replace("users", "accounts"))
+
+    llm = TriageLLM()
+    outcome = triage(repo, llm, "s")  # prompts again
+    assert outcome.findings["SEC-1"].status == "skipped"
+    assert "SQL injection via name" in suppressed_block(llm.review_prompts[0])
+
+
+def test_reworded_title_is_not_filtered(repo):
+    class RewordLLM(TriageLLM):
+        def structured(self, system, user, schema, tools=None):
+            result = super().structured(system, user, schema, tools)
+            for finding in result.get("findings", []):
+                finding["title"] = "Unsafe string interpolation"
+            return result
+
+    triage(repo, TriageLLM(), "p")
+    assert triage(repo, RewordLLM(), "s").findings["SEC-1"].status == "skipped"
+
+
+def test_title_case_and_spacing_still_match(repo):
+    class RecaseLLM(TriageLLM):
+        def structured(self, system, user, schema, tools=None):
+            result = super().structured(system, user, schema, tools)
+            for finding in result.get("findings", []):
+                finding["title"] = "sql  INJECTION via name"
+            return result
+
+    triage(repo, TriageLLM(), "p")
+    assert triage(repo, RecaseLLM()).findings["SEC-1"].status == "suppressed"
+
+
+class NoLineLLM(TriageLLM):
+    def structured(self, system, user, schema, tools=None):
+        result = super().structured(system, user, schema, tools)
+        for finding in result.get("findings", []):
+            finding["line"] = 0
+        return result
+
+
+def test_finding_without_a_line_is_not_filtered_or_saved_twice(repo):
+    triage(repo, NoLineLLM(), "p")
+    assert triage(repo, NoLineLLM(), "p").findings["SEC-1"].status == "false_positive"
+    assert len(saved(repo)) == 1
+
+
+def test_reviewers_only_see_their_own_suppressions_for_files_under_review(repo):
+    def entry(reviewer, file, title):
+        return {"reviewer": reviewer, "severity": "major", "file": file, "title": title, "detail": "d", "code": "x",
+                "decided_by": "you", "reason": "r", "decided_at": "2026-11-02"}
+
+    suppressions_file(repo).parent.mkdir()
+    suppressions_file(repo).write_text(json.dumps({"version": 1, "suppressions": [
+        entry("security", "app.py", "wanted"),
+        entry("security", "other.py", "other file"),
+        entry("safety", "app.py", "other reviewer"),
+    ]}))
+    llm = TriageLLM()
+    triage(repo, llm, "s")
+    block = suppressed_block(llm.review_prompts[0])
+    assert "wanted" in block
+    assert "other file" not in block
+    assert "other reviewer" not in block
+
+
+def test_abort_keeps_decisions_already_made(repo):
+    class TwoFindingsLLM(TriageLLM):
+        def structured(self, system, user, schema, tools=None):
+            result = super().structured(system, user, schema, tools)
+            if schema is REVIEW_SCHEMA and "Your area is security" in system:
+                result["findings"].append({"severity": "major", "file": "app.py", "line": 1, "title": "second",
+                                           "detail": "d", "suggestion": "s"})
+            return result
+
+    assert triage(repo, TwoFindingsLLM(), "p", EOFError()).status == "triage_aborted"
+    assert len(saved(repo)) == 1
+
+
+@pytest.mark.parametrize("content", ["{not json", '{"version": 1}', '{"suppressions": [{"file": "a"}]}'])
+def test_malformed_file_stops_the_run_and_is_kept(repo, monkeypatch, capsys, content):
+    class NoCallsLLM:
+        usage = Usage()
+
+        def structured(self, *_):
+            raise AssertionError("no review should run")
+
+    suppressions_file(repo).parent.mkdir()
+    suppressions_file(repo).write_text(content)
+    monkeypatch.setattr(cli, "ClaudeCodeLLM", lambda **_: NoCallsLLM())
+    assert cli.main(["--repo", str(repo), "-y"]) == 2
+    assert suppressions.FILENAME in capsys.readouterr().err
+    assert suppressions_file(repo).read_text() == content
 
 
 class FakeTTY(io.StringIO):

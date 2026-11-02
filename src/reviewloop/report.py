@@ -27,6 +27,7 @@ def write(outcome: Outcome, out_dir: Path, usage) -> Path:
 
     for title, statuses in [("Open", {"open"}), ("Won't fix (overseer)", {"wont_fix"}),
                             ("Skipped (you)", {"skipped"}), ("False positive (you)", {"false_positive"}),
+                            ("Suppressed (dismissed in an earlier decision)", {"suppressed"}),
                             ("Deferred", {"deferred"}), ("Resolved", {"resolved"})]:
         group = [f for f in findings if f.status in statuses]
         if not group:

@@ -3,14 +3,16 @@
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from importlib.resources import files as package_files
 from pathlib import Path
 from typing import Callable, Protocol
 
-from . import context
+from . import context, suppressions
 from .edits import EditResult, apply_edits
 from .llm import LLMError, Usage
 from .schemas import FIXER_SCHEMA, OVERSEER_SCHEMA, REVIEW_SCHEMA, SEVERITIES, Finding
+from .suppressions import Suppression
 
 PROMPTS = package_files("reviewloop") / "prompts"
 EXPLORE_TOOLS = ["Read", "Grep", "Glob"]
@@ -110,6 +112,8 @@ class ReviewLoop:
         self.marked_fix: set[str] = set()  # finding ids the user sent to the fixer in triage
         self.counters = {r.prefix: 0 for r in reviewers}
         self.backup_dir = cfg.out_dir / "backup" if cfg.out_dir else None
+        self.suppressions_path = cfg.out_dir / suppressions.FILENAME if cfg.out_dir else None
+        self.suppressions = suppressions.load(self.suppressions_path) if self.suppressions_path else []
 
     # ---- main loop -------------------------------------------------------
 
@@ -136,7 +140,7 @@ class ReviewLoop:
             # The last round has no review left to verify a fix, so there is nothing to triage.
             triaging = cfg.triage and cfg.fix and n < cfg.max_rounds
             try:
-                to_fix = self._triage(n, rl) if triaging else []
+                to_fix = self._triage(n, ctx, rl) if triaging else []
             except TriageAborted:
                 self.log("Triage aborted; the fixer did not run this round.")
                 return Outcome("triage_aborted", rounds, self.findings)
@@ -186,7 +190,7 @@ class ReviewLoop:
         self.log(f"  reviewing in parallel: {', '.join(r.name for r in self.reviewers)}")
         with ThreadPoolExecutor(max_workers=len(self.reviewers)) as pool:
             pending = {
-                pool.submit(self.llm.structured, r.system, self._review_prompt(r, n, rendered, fix_diff),
+                pool.submit(self.llm.structured, r.system, self._review_prompt(r, n, rendered, fix_diff, ctx.files),
                             REVIEW_SCHEMA, EXPLORE_TOOLS if self.cfg.explore else None): r
                 for r in self.reviewers
             }
@@ -203,13 +207,18 @@ class ReviewLoop:
                         rl.errors[r.name] = str(e)
                         self.log(f"  {r.name}: ERROR {e} ({_elapsed(start)})")
                         continue
-                    self._record_review(r, n, result, rl, _elapsed(start))
+                    self._record_review(r, n, result, rl, _elapsed(start), ctx.files)
 
-    def _review_prompt(self, r: Reviewer, n: int, rendered: str, fix_diff: str) -> str:
+    def _review_prompt(self, r: Reviewer, n: int, rendered: str, fix_diff: str, files: dict[str, str]) -> str:
         mine = [f for f in self.findings.values() if f.reviewer == r.name]
         open_ = [f for f in mine if f.status == "open"]
         closed = [f for f in mine if f.status in CLOSED_STATUSES]
         parts = [rendered, f"\nThis is review round {n}."]
+        dismissed = [s for s in self.suppressions if s.reviewer == r.name and s.file in files]
+        if dismissed:
+            parts.append("<suppressed_findings>")
+            parts += [s.prompt_line() + "\n" for s in dismissed]
+            parts.append("</suppressed_findings>")
         if n == 1:
             parts.append("Review the change in your area.")
             return "\n".join(parts)
@@ -224,9 +233,9 @@ class ReviewLoop:
         parts.append("Report the status of each open finding, then any new findings.")
         return "\n".join(parts)
 
-    def _record_review(self, r: Reviewer, n: int, result: dict, rl: RoundLog, took: str) -> None:
+    def _record_review(self, r: Reviewer, n: int, result: dict, rl: RoundLog, took: str, files: dict[str, str]) -> None:
         rl.summaries[r.name] = result["summary"]
-        resolved = 0
+        resolved = suppressed = 0
         for prev in result["previous"]:
             f = self.findings.get(prev["id"])
             if not f or f.reviewer != r.name or f.status != "open":
@@ -239,17 +248,46 @@ class ReviewLoop:
         for item in result["findings"]:
             self.counters[r.prefix] += 1
             fid = f"{r.prefix}-{self.counters[r.prefix]}"
-            self.findings[fid] = Finding(id=fid, reviewer=r.name, round_found=n, history=[f"r{n}: found"], **item)
-            rl.new.append(fid)
+            finding = Finding(id=fid, reviewer=r.name, round_found=n, history=[f"r{n}: found"], **item)
+            self.findings[fid] = finding
+            code = suppressions.code_at(files, finding.file, finding.line)
+            match = next((s for s in self.suppressions if s.matches(r.name, finding.file, finding.title, code)), None)
+            if match:
+                finding.status = "suppressed"
+                finding.history.append(f"r{n}: suppressed, dismissed earlier by {match.decided_by} — {match.reason}")
+                suppressed += 1
+            else:
+                rl.new.append(fid)
 
         still_open = [f for f in self.findings.values() if f.reviewer == r.name and f.status == "open"]
         blocking = sum(f.severity in self.cfg.blocking for f in still_open)
         verdict = "approves" if not blocking else f"requests changes ({blocking} blocking)"
-        self.log(f"  {r.name}: {verdict}; {len(still_open)} open, {resolved} resolved this round ({took})")
+        note = f", {suppressed} suppressed" if suppressed else ""
+        self.log(f"  {r.name}: {verdict}; {len(still_open)} open, {resolved} resolved this round{note} ({took})")
+
+    # ---- suppressions ----------------------------------------------------
+
+    def _remember(self, f: Finding, files: dict[str, str], decided_by: str, reason: str) -> None:
+        """Save a dismissal right away, so an interrupted run keeps it."""
+        code = suppressions.code_at(files, f.file, f.line)
+        known = any(s.reviewer == f.reviewer and s.file == f.file and s.title == f.title and s.code == code
+                    for s in self.suppressions)
+        if known:
+            return
+        self.suppressions.append(Suppression(
+            reviewer=f.reviewer, severity=f.severity, file=f.file, title=f.title, detail=f.detail, code=code,
+            decided_by=decided_by, reason=reason, decided_at=datetime.now(timezone.utc).date().isoformat(),
+        ))
+        if not self.suppressions_path:
+            return
+        try:
+            suppressions.save(self.suppressions_path, self.suppressions)
+        except OSError as e:
+            self.log(f"  warning: couldn't save {self.suppressions_path}: {e}")
 
     # ---- triage ----------------------------------------------------------
 
-    def _triage(self, n: int, rl: RoundLog) -> list[tuple[Finding, str]]:
+    def _triage(self, n: int, ctx: context.ReviewContext, rl: RoundLog) -> list[tuple[Finding, str]]:
         """Ask about each undecided finding; return every open finding the user wants fixed."""
         undecided = [f for f in self.findings.values() if f.status == "open" and f.id not in self.marked_fix]
         undecided.sort(key=lambda f: (SEVERITIES.index(f.severity), f.id))
@@ -264,6 +302,8 @@ class ReviewLoop:
                 self.marked_fix.add(f.id)
             else:
                 f.status = TRIAGE_STATUS[action]
+            if action == "false_positive":
+                self._remember(f, ctx.files, "you", "marked false positive in triage")
         return [(f, "") for f in self.findings.values() if f.status == "open" and f.id in self.marked_fix]
 
     def _ask_action(self) -> str:
@@ -317,6 +357,8 @@ class ReviewLoop:
             else:
                 f.status = "wont_fix" if d["action"] == "wont_fix" else "deferred"
                 f.history.append(f"r{n}: overseer {d['action']} — {d['reason']}")
+                if d["action"] == "wont_fix":
+                    self._remember(f, ctx.files, "overseer", d["reason"])
 
         counts = {a: sum(d["action"] == a for d in rl.decisions) for a in ("fix", "wont_fix", "defer")}
         self.log(f"  overseer: {counts['fix']} to fix, {counts['wont_fix']} won't fix, {counts['defer']} deferred ({_elapsed(start)})")
