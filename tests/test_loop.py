@@ -248,12 +248,12 @@ class WontFixLLM(TriageLLM):
 
 
 def test_false_positive_is_not_raised_again_on_next_run(repo):
-    assert triage(repo, TriageLLM(), "p").findings["SEC-1"].status == "false_positive"
+    assert triage(repo, TriageLLM(severity="major"), "p").findings["SEC-1"].status == "false_positive"
     entry = saved(repo)[0]
     assert (entry["reviewer"], entry["file"], entry["decided_by"]) == ("security", "app.py", "you")
 
     # scripted() raises IndexError if the second run prompts.
-    llm = TriageLLM()
+    llm = TriageLLM(severity="major")
     outcome = triage(repo, llm)
     assert outcome.status == "approved"
     assert outcome.findings["SEC-1"].status == "suppressed"
@@ -264,11 +264,11 @@ def test_false_positive_is_not_raised_again_on_next_run(repo):
 
 
 def test_overseer_wont_fix_is_suppressed_on_next_run(repo):
-    run(repo, WontFixLLM())
+    run(repo, WontFixLLM(severity="major"))
     assert saved(repo)[0]["decided_by"] == "overseer"
     assert saved(repo)[0]["reason"] == "ORM escapes it"
 
-    outcome = run(repo, TriageLLM())  # would fail the test if the overseer ran
+    outcome = run(repo, TriageLLM(severity="major"))  # would fail the test if the overseer ran
     assert outcome.status == "approved"
     assert outcome.findings["SEC-1"].status == "suppressed"
 
@@ -279,10 +279,10 @@ def test_skip_is_not_saved(repo):
 
 
 def test_changed_code_is_not_filtered(repo):
-    triage(repo, TriageLLM(), "p")
+    triage(repo, TriageLLM(severity="major"), "p")
     (repo / "app.py").write_text(BUGGY.replace("users", "accounts"))
 
-    llm = TriageLLM()
+    llm = TriageLLM(severity="major")
     outcome = triage(repo, llm, "s")  # prompts again
     assert outcome.findings["SEC-1"].status == "skipped"
     assert "SQL injection via name" in suppressed_block(llm.review_prompts[0])
@@ -296,8 +296,8 @@ def test_reworded_title_is_not_filtered(repo):
                 finding["title"] = "Unsafe string interpolation"
             return result
 
-    triage(repo, TriageLLM(), "p")
-    assert triage(repo, RewordLLM(), "s").findings["SEC-1"].status == "skipped"
+    triage(repo, TriageLLM(severity="major"), "p")
+    assert triage(repo, RewordLLM(severity="major"), "s").findings["SEC-1"].status == "skipped"
 
 
 def test_title_case_and_spacing_still_match(repo):
@@ -308,8 +308,8 @@ def test_title_case_and_spacing_still_match(repo):
                 finding["title"] = "sql  INJECTION via name"
             return result
 
-    triage(repo, TriageLLM(), "p")
-    assert triage(repo, RecaseLLM()).findings["SEC-1"].status == "suppressed"
+    triage(repo, TriageLLM(severity="major"), "p")
+    assert triage(repo, RecaseLLM(severity="major")).findings["SEC-1"].status == "suppressed"
 
 
 class NoLineLLM(TriageLLM):
@@ -321,9 +321,43 @@ class NoLineLLM(TriageLLM):
 
 
 def test_finding_without_a_line_is_not_filtered_or_saved_twice(repo):
-    triage(repo, NoLineLLM(), "p")
-    assert triage(repo, NoLineLLM(), "p").findings["SEC-1"].status == "false_positive"
+    triage(repo, NoLineLLM(severity="major"), "p")
+    assert triage(repo, NoLineLLM(severity="major"), "p").findings["SEC-1"].status == "false_positive"
     assert len(saved(repo)) == 1
+
+
+def test_blocker_false_positive_is_not_saved_and_comes_back(repo):
+    assert triage(repo, TriageLLM(), "p").status == "approved"
+    assert not suppressions_file(repo).exists()
+
+    llm = TriageLLM()
+    outcome = triage(repo, llm, "s")  # prompts again
+    assert outcome.findings["SEC-1"].status == "skipped"
+    assert suppressed_block(llm.review_prompts[0]) == ""
+
+
+def test_overseer_wont_fix_on_a_blocker_is_not_saved(repo):
+    assert run(repo, WontFixLLM()).findings["SEC-1"].status == "wont_fix"
+    assert not suppressions_file(repo).exists()
+
+
+def test_dismissed_major_reported_as_blocker_is_not_filtered(repo):
+    triage(repo, TriageLLM(severity="major"), "p")
+    assert triage(repo, TriageLLM(severity="blocker"), "s").findings["SEC-1"].status == "skipped"
+
+
+def test_blocker_entry_added_to_the_file_is_ignored(repo):
+    code = BUGGY.splitlines()[1].strip()
+    suppressions_file(repo).parent.mkdir()
+    suppressions_file(repo).write_text(json.dumps({"version": 1, "suppressions": [{
+        "reviewer": "security", "severity": "blocker", "file": "app.py", "title": "SQL injection via name",
+        "detail": "d", "code": code, "decided_by": "you", "reason": "r", "decided_at": "2026-11-02"}]}))
+
+    # Reported at a lower severity, so only the entry's own severity can stop the match.
+    llm = TriageLLM(severity="major")
+    outcome = triage(repo, llm, "s")
+    assert outcome.findings["SEC-1"].status == "skipped"
+    assert suppressed_block(llm.review_prompts[0]) == ""
 
 
 def test_reviewers_only_see_their_own_suppressions_for_files_under_review(repo):
@@ -354,7 +388,7 @@ def test_abort_keeps_decisions_already_made(repo):
                                            "detail": "d", "suggestion": "s"})
             return result
 
-    assert triage(repo, TwoFindingsLLM(), "p", EOFError()).status == "triage_aborted"
+    assert triage(repo, TwoFindingsLLM(severity="major"), "p", EOFError()).status == "triage_aborted"
     assert len(saved(repo)) == 1
 
 

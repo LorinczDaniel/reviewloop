@@ -9,6 +9,11 @@ FILENAME = "suppressions.json"
 VERSION = 1
 
 
+def can_suppress(severity: str) -> bool:
+    """Blockers always come back, whoever dismissed them and whatever the file says."""
+    return severity != "blocker"
+
+
 @dataclass(frozen=True)
 class Suppression:
     reviewer: str
