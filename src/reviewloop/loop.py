@@ -124,6 +124,10 @@ class ReviewLoop:
         if not files:
             return Outcome("nothing_to_review", [], self.findings)
         self.log(f"Reviewing {len(files)} file(s) against {cfg.base} with: {', '.join(r.name for r in self.reviewers)}")
+        rules, notes = context.load_rules(cfg.repo, cfg.base, files)
+        self.log(f"Project rules: {', '.join(rules) or 'none found'}")
+        for note in notes:
+            self.log(f"  {note}")
 
         rounds: list[RoundLog] = []
         checks = self._run_checks()
@@ -133,7 +137,7 @@ class ReviewLoop:
             rl = RoundLog(n, checks=checks)
             rounds.append(rl)
             self.log(f"\n── Round {n}/{cfg.max_rounds} " + "─" * 40)
-            ctx = context.gather(cfg.repo, cfg.base, files, checks)
+            ctx = context.gather(cfg.repo, cfg.base, files, checks, rules)
 
             self._review(n, ctx, fix_diff, rl)
 

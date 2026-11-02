@@ -59,6 +59,9 @@ class ClaudeCodeLLM:
             "--effort", self.effort,
             "--tools", ",".join(tools or []),
             "--no-session-persistence",
+            # Project files can be part of the change under review, so don't let
+            # Claude Code auto-load them. Project rules arrive in the prompt instead.
+            "--setting-sources", "user",
         ]
         try:
             proc = subprocess.run(
