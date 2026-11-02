@@ -9,11 +9,6 @@ FILENAME = "suppressions.json"
 VERSION = 1
 
 
-def can_suppress(severity: str) -> bool:
-    """Blockers always come back, whoever dismissed them and whatever the file says."""
-    return severity != "blocker"
-
-
 @dataclass(frozen=True)
 class Suppression:
     reviewer: str
@@ -22,9 +17,13 @@ class Suppression:
     title: str
     detail: str
     code: str  # the flagged line when the decision was made; "" if there wasn't one
-    decided_by: str  # overseer | you
+    decided_by: str  # overseer | human
     reason: str
     decided_at: str
+
+    def covers(self, severity: str) -> bool:
+        """Whether this entry can dismiss a finding of this severity: only a human can dismiss a blocker."""
+        return self.decided_by == "human" or "blocker" not in (self.severity, severity)
 
     def matches(self, reviewer: str, file: str, title: str, code: str) -> bool:
         """True for the same finding on the same line of code.

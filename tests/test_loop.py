@@ -250,7 +250,7 @@ class WontFixLLM(TriageLLM):
 def test_false_positive_is_not_raised_again_on_next_run(repo):
     assert triage(repo, TriageLLM(severity="major"), "p").findings["SEC-1"].status == "false_positive"
     entry = saved(repo)[0]
-    assert (entry["reviewer"], entry["file"], entry["decided_by"]) == ("security", "app.py", "you")
+    assert (entry["reviewer"], entry["file"], entry["decided_by"]) == ("security", "app.py", "human")
 
     # scripted() raises IndexError if the second run prompts.
     llm = TriageLLM(severity="major")
@@ -326,32 +326,48 @@ def test_finding_without_a_line_is_not_filtered_or_saved_twice(repo):
     assert len(saved(repo)) == 1
 
 
-def test_blocker_false_positive_is_not_saved_and_comes_back(repo):
+def test_human_false_positive_on_a_blocker_is_suppressed_on_next_run(repo):
     assert triage(repo, TriageLLM(), "p").status == "approved"
-    assert not suppressions_file(repo).exists()
+    assert saved(repo)[0]["severity"] == "blocker"
 
     llm = TriageLLM()
-    outcome = triage(repo, llm, "s")  # prompts again
-    assert outcome.findings["SEC-1"].status == "skipped"
-    assert suppressed_block(llm.review_prompts[0]) == ""
+    outcome = triage(repo, llm)
+    assert outcome.status == "approved"
+    assert outcome.findings["SEC-1"].status == "suppressed"
+    assert "SQL injection via name" in suppressed_block(llm.review_prompts[0])
 
 
-def test_overseer_wont_fix_on_a_blocker_is_not_saved(repo):
-    assert run(repo, WontFixLLM()).findings["SEC-1"].status == "wont_fix"
+def test_overseer_cannot_close_a_blocker(repo):
+    outcome = run(repo, WontFixLLM())
+    assert outcome.rounds[0].decisions[0]["action"] == "fix"
+    assert outcome.findings["SEC-1"].status == "resolved"
+    assert (repo / "app.py").read_text() == FIXED
     assert not suppressions_file(repo).exists()
 
 
-def test_dismissed_major_reported_as_blocker_is_not_filtered(repo):
-    triage(repo, TriageLLM(severity="major"), "p")
+def test_blocker_the_fixer_cannot_resolve_goes_to_a_human(repo):
+    outcome = run(repo, WontFixLLM(fixer_edit_old="no such text"), max_rounds=2)
+    assert outcome.status == "not_converged"
+    assert outcome.findings["SEC-1"].status == "open"
+
+
+def test_overseer_dismissal_of_a_major_does_not_cover_a_blocker(repo):
+    run(repo, WontFixLLM(severity="major"))
+    assert saved(repo)[0]["decided_by"] == "overseer"
     assert triage(repo, TriageLLM(severity="blocker"), "s").findings["SEC-1"].status == "skipped"
 
 
-def test_blocker_entry_added_to_the_file_is_ignored(repo):
+def test_human_dismissal_of_a_major_covers_a_blocker(repo):
+    triage(repo, TriageLLM(severity="major"), "p")
+    assert triage(repo, TriageLLM(severity="blocker")).findings["SEC-1"].status == "suppressed"
+
+
+def test_overseer_blocker_entry_added_to_the_file_is_ignored(repo):
     code = BUGGY.splitlines()[1].strip()
     suppressions_file(repo).parent.mkdir()
     suppressions_file(repo).write_text(json.dumps({"version": 1, "suppressions": [{
         "reviewer": "security", "severity": "blocker", "file": "app.py", "title": "SQL injection via name",
-        "detail": "d", "code": code, "decided_by": "you", "reason": "r", "decided_at": "2026-11-02"}]}))
+        "detail": "d", "code": code, "decided_by": "overseer", "reason": "r", "decided_at": "2026-11-02"}]}))
 
     # Reported at a lower severity, so only the entry's own severity can stop the match.
     llm = TriageLLM(severity="major")
@@ -363,7 +379,7 @@ def test_blocker_entry_added_to_the_file_is_ignored(repo):
 def test_reviewers_only_see_their_own_suppressions_for_files_under_review(repo):
     def entry(reviewer, file, title):
         return {"reviewer": reviewer, "severity": "major", "file": file, "title": title, "detail": "d", "code": "x",
-                "decided_by": "you", "reason": "r", "decided_at": "2026-11-02"}
+                "decided_by": "human", "reason": "r", "decided_at": "2026-11-02"}
 
     suppressions_file(repo).parent.mkdir()
     suppressions_file(repo).write_text(json.dumps({"version": 1, "suppressions": [

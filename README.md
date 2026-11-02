@@ -89,7 +89,7 @@ Exit codes: `0` approved, nothing to review, or report-only; `1` not converged (
 
 - **Severity gating.** Only `blocker` and `major` findings block approval (`--block` changes this). Minor issues and nits get reported but never hold up the loop.
 - **Re-reviews check earlier findings.** From round 2 on, each reviewer gets its own open findings plus the diff of the latest fixes. It marks each finding resolved or still open, and only adds new issues.
-- **The overseer settles conflicts.** Priority is safety > security > readability. Findings it closes as `wont_fix` (each with a reason) are not raised again. It cannot defer a blocking finding.
+- **The overseer settles conflicts.** Priority is safety > security > readability. Findings it closes as `wont_fix` (each with a reason) are not raised again. It cannot defer a blocking finding or close a blocker as `wont_fix`. A blocker the fixer can't resolve stops the run at the round limit, and you can close it yourself with `--triage`.
 - **Hard limits.** `--max-rounds` (default 4), and any failing `--check` blocks approval.
 
 ## Triage
@@ -108,14 +108,14 @@ Pressing Ctrl-C or Ctrl-D at a prompt stops the run with exit code `1`. The fixe
 
 ## Suppressions
 
-When the overseer closes a finding as `wont_fix`, or you mark one as a false positive in triage, the decision is saved to `.reviewloop/suppressions.json`, so later runs don't raise it again. Skipped findings aren't saved, because skipping only means not now. Blockers are never saved, so a reviewer can raise one again on any later run, even if you marked it a false positive. If you pass `--out`, the file lives in that directory instead.
+When the overseer closes a finding as `wont_fix`, or you mark one as a false positive in triage, the decision is saved to `.reviewloop/suppressions.json`, so later runs don't raise it again. Skipped findings aren't saved, because skipping only means not now. The overseer can't close a blocker as `wont_fix`, so only your decisions can suppress one. If you pass `--out`, the file lives in that directory instead.
 
 Later runs use the file in two ways:
 
 - **Reviewers are told.** Each reviewer gets its own earlier dismissals for the files under review, and is asked not to report them again unless the code has changed so that the reason no longer holds.
 - **Exact repeats are filtered.** If a reviewer still reports a finding it reported before, with the same title on the same file and the flagged line unchanged, the finding is marked suppressed. It doesn't block approval or prompt you, but the report still lists it.
 
-A finding reported as a blocker is never filtered, even if it was dismissed earlier at a lower severity, and blocker entries added to the file by hand are ignored. Each entry records `decided_by`, `severity` and `reason`, so you can check them. To bring a finding back, delete its entry; to start over, delete the file. If the file is malformed, the run stops with exit code `2` before any review starts, and the file isn't changed.
+An overseer dismissal never covers a blocker: if a finding it closed at a lower severity comes back as a blocker, it isn't filtered. Your own false positive holds at any severity. Each entry records `decided_by`, `severity` and `reason`, so you can check them. To bring a finding back, delete its entry; to start over, delete the file. If the file is malformed, the run stops with exit code `2` before any review starts, and the file isn't changed.
 
 The file is per clone, because `.reviewloop` ignores itself in git.
 

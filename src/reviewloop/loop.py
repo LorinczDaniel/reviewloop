@@ -215,7 +215,7 @@ class ReviewLoop:
         closed = [f for f in mine if f.status in CLOSED_STATUSES]
         parts = [rendered, f"\nThis is review round {n}."]
         dismissed = [s for s in self.suppressions
-                     if s.reviewer == r.name and s.file in files and suppressions.can_suppress(s.severity)]
+                     if s.reviewer == r.name and s.file in files and s.covers(s.severity)]
         if dismissed:
             parts.append("<suppressed_findings>")
             parts += [s.prompt_line() + "\n" for s in dismissed]
@@ -252,9 +252,9 @@ class ReviewLoop:
             finding = Finding(id=fid, reviewer=r.name, round_found=n, history=[f"r{n}: found"], **item)
             self.findings[fid] = finding
             code = suppressions.code_at(files, finding.file, finding.line)
-            match = next((s for s in self.suppressions if suppressions.can_suppress(s.severity)
+            match = next((s for s in self.suppressions if s.covers(finding.severity)
                           and s.matches(r.name, finding.file, finding.title, code)), None)
-            if match and suppressions.can_suppress(finding.severity):
+            if match:
                 finding.status = "suppressed"
                 finding.history.append(f"r{n}: suppressed, dismissed earlier by {match.decided_by} — {match.reason}")
                 suppressed += 1
@@ -271,8 +271,6 @@ class ReviewLoop:
 
     def _remember(self, f: Finding, files: dict[str, str], decided_by: str, reason: str) -> None:
         """Save a dismissal right away, so an interrupted run keeps it."""
-        if not suppressions.can_suppress(f.severity):
-            return
         code = suppressions.code_at(files, f.file, f.line)
         known = any(s.reviewer == f.reviewer and s.file == f.file and s.title == f.title and s.code == code
                     for s in self.suppressions)
@@ -307,7 +305,7 @@ class ReviewLoop:
             else:
                 f.status = TRIAGE_STATUS[action]
             if action == "false_positive":
-                self._remember(f, ctx.files, "you", "marked false positive in triage")
+                self._remember(f, ctx.files, "human", "marked false positive in triage")
         return [(f, "") for f in self.findings.values() if f.status == "open" and f.id in self.marked_fix]
 
     def _ask_action(self) -> str:
@@ -354,6 +352,8 @@ class ReviewLoop:
             d = decided.get(f.id) or {"id": f.id, "action": "fix" if blocking else "defer", "reason": "no decision returned", "guidance": ""}
             if d["action"] == "defer" and blocking:
                 d = {**d, "action": "fix", "reason": f"cannot defer a {f.severity}; {d['reason']}"}
+            if d["action"] == "wont_fix" and f.severity == "blocker":
+                d = {**d, "action": "fix", "reason": f"only a human can close a blocker; {d['reason']}"}
             rl.decisions.append(d)
             if d["action"] == "fix":
                 f.history.append(f"r{n}: overseer fix — {d['guidance'] or d['reason']}")
