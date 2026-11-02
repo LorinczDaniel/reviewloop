@@ -10,11 +10,22 @@ from typing import Callable, Protocol
 from . import context
 from .edits import EditResult, apply_edits
 from .llm import LLMError, Usage
-from .schemas import FIXER_SCHEMA, OVERSEER_SCHEMA, REVIEW_SCHEMA, Finding
+from .schemas import FIXER_SCHEMA, OVERSEER_SCHEMA, REVIEW_SCHEMA, SEVERITIES, Finding
 
 PROMPTS = package_files("reviewloop") / "prompts"
 EXPLORE_TOOLS = ["Read", "Grep", "Glob"]
 HEARTBEAT_SECONDS = 30
+TRIAGE_ANSWERS = {
+    "f": "fix", "fix": "fix",
+    "s": "skip", "skip": "skip",
+    "p": "false_positive", "fp": "false_positive", "false positive": "false_positive",
+}
+TRIAGE_STATUS = {"skip": "skipped", "false_positive": "false_positive"}
+CLOSED_STATUSES = ("wont_fix", "deferred", *TRIAGE_STATUS.values())
+
+
+class TriageAborted(Exception):
+    """The user ended triage (Ctrl-C or Ctrl-D) before deciding on every finding."""
 
 
 def _elapsed(start: float) -> str:
@@ -66,6 +77,7 @@ class Config:
     fix: bool = True
     out_dir: Path | None = None
     explore: bool = False  # give reviewers read-only repo tools (claude-code backend)
+    triage: bool = False  # the user decides on each finding; the overseer doesn't run
 
 
 @dataclass
@@ -85,15 +97,17 @@ class RoundLog:
 
 @dataclass
 class Outcome:
-    status: str  # approved | not_converged | report_only | nothing_to_review
+    status: str  # approved | not_converged | report_only | nothing_to_review | triage_aborted
     rounds: list[RoundLog]
     findings: dict[str, Finding]
 
 
 class ReviewLoop:
-    def __init__(self, cfg: Config, llm: LLM, reviewers: list[Reviewer], log: Callable[[str], None] = print):
-        self.cfg, self.llm, self.reviewers, self.log = cfg, llm, reviewers, log
+    def __init__(self, cfg: Config, llm: LLM, reviewers: list[Reviewer], log: Callable[[str], None] = print,
+                 ask: Callable[[str], str] = input):
+        self.cfg, self.llm, self.reviewers, self.log, self.ask = cfg, llm, reviewers, log, ask
         self.findings: dict[str, Finding] = {}
+        self.marked_fix: set[str] = set()  # finding ids the user sent to the fixer in triage
         self.counters = {r.prefix: 0 for r in reviewers}
         self.backup_dir = cfg.out_dir / "backup" if cfg.out_dir else None
 
@@ -118,18 +132,28 @@ class ReviewLoop:
 
             self._review(n, ctx, fix_diff, rl)
 
-            if self._approved(rl):
-                self.log("All reviewers satisfied and checks pass.")
+            # Triage comes before the approval check so non-blocking findings get a say too.
+            # The last round has no review left to verify a fix, so there is nothing to triage.
+            triaging = cfg.triage and cfg.fix and n < cfg.max_rounds
+            try:
+                to_fix = self._triage(n, rl) if triaging else []
+            except TriageAborted:
+                self.log("Triage aborted; the fixer did not run this round.")
+                return Outcome("triage_aborted", rounds, self.findings)
+
+            if self._approved(rl) and not to_fix:
+                self.log("No blocking findings remain and checks pass.")
                 return Outcome("approved", rounds, self.findings)
             if not cfg.fix:
                 return Outcome("report_only", rounds, self.findings)
             if n == cfg.max_rounds:
                 break  # no review left to verify another fix
 
-            to_fix = self._oversee(n, ctx, rl)
-            if self._approved(rl):
-                self.log("Overseer closed the remaining blocking findings.")
-                return Outcome("approved", rounds, self.findings)
+            if not triaging:
+                to_fix = self._oversee(n, ctx, rl)
+                if self._approved(rl):
+                    self.log("Overseer closed the remaining blocking findings.")
+                    return Outcome("approved", rounds, self.findings)
 
             fix_diff, failed_edits = self._fix(n, ctx, to_fix, failed_edits, rl)
             checks = self._run_checks()
@@ -184,7 +208,7 @@ class ReviewLoop:
     def _review_prompt(self, r: Reviewer, n: int, rendered: str, fix_diff: str) -> str:
         mine = [f for f in self.findings.values() if f.reviewer == r.name]
         open_ = [f for f in mine if f.status == "open"]
-        closed = [f for f in mine if f.status in ("wont_fix", "deferred")]
+        closed = [f for f in mine if f.status in CLOSED_STATUSES]
         parts = [rendered, f"\nThis is review round {n}."]
         if n == 1:
             parts.append("Review the change in your area.")
@@ -193,9 +217,9 @@ class ReviewLoop:
         parts += [f.full() + "\nHistory: " + "; ".join(f.history) for f in open_] or ["(none)"]
         parts.append("</your_open_findings>")
         if closed:
-            parts.append("<closed_by_overseer>")
+            parts.append("<closed_findings>")
             parts += [f"{f.brief()} — {f.status}: {f.history[-1]}" for f in closed]
-            parts.append("</closed_by_overseer>")
+            parts.append("</closed_findings>")
         parts += ["<fixes_since_last_review>", fix_diff or "(no changes)", "</fixes_since_last_review>"]
         parts.append("Report the status of each open finding, then any new findings.")
         return "\n".join(parts)
@@ -222,6 +246,36 @@ class ReviewLoop:
         blocking = sum(f.severity in self.cfg.blocking for f in still_open)
         verdict = "approves" if not blocking else f"requests changes ({blocking} blocking)"
         self.log(f"  {r.name}: {verdict}; {len(still_open)} open, {resolved} resolved this round ({took})")
+
+    # ---- triage ----------------------------------------------------------
+
+    def _triage(self, n: int, rl: RoundLog) -> list[tuple[Finding, str]]:
+        """Ask about each undecided finding; return every open finding the user wants fixed."""
+        undecided = [f for f in self.findings.values() if f.status == "open" and f.id not in self.marked_fix]
+        undecided.sort(key=lambda f: (SEVERITIES.index(f.severity), f.id))
+        if undecided:
+            self.log(f"\n  triage: {len(undecided)} finding(s) to decide on")
+        for i, f in enumerate(undecided, 1):
+            self.log(f"\n  ({i}/{len(undecided)}) {f.full()}")
+            action = self._ask_action()
+            rl.decisions.append({"id": f.id, "action": action, "reason": "marked in triage", "guidance": ""})
+            f.history.append(f"r{n}: you marked {action.replace('_', ' ')}")
+            if action == "fix":
+                self.marked_fix.add(f.id)
+            else:
+                f.status = TRIAGE_STATUS[action]
+        return [(f, "") for f in self.findings.values() if f.status == "open" and f.id in self.marked_fix]
+
+    def _ask_action(self) -> str:
+        while True:
+            try:
+                answer = self.ask("  [f]ix, [s]kip, false [p]ositive? ")
+            except (EOFError, KeyboardInterrupt) as e:
+                raise TriageAborted from e
+            action = TRIAGE_ANSWERS.get(answer.strip().lower())
+            if action:
+                return action
+            self.log("  Please answer f, s or p.")
 
     # ---- overseer --------------------------------------------------------
 

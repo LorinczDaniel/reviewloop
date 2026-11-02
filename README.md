@@ -52,6 +52,9 @@ reviewloop --base main
 
 # quicker and cheaper
 reviewloop --fast
+
+# decide on each finding yourself instead of using the overseer
+reviewloop --triage
 ```
 
 Before the fixer edits anything, it asks for confirmation (skip that with `-y`). The original of every file it touches is saved under `.reviewloop/backup/`, and `git diff` shows what changed.
@@ -66,6 +69,7 @@ By default each agent is a headless `claude -p` call on your Claude Code login, 
 |---|---|---|
 | `--base REF` | `HEAD` | Review changes against this git ref, e.g. `main` |
 | `--no-fix` | off | One review pass and a report; no files are changed |
+| `--triage` | off | Mark each finding fix, skip or false positive yourself; the overseer doesn't run. Needs an interactive terminal |
 | `--check CMD` | none | Command that must pass before approval, e.g. `"pytest -q"`. Repeatable |
 | `--max-rounds N` | `4` | Stop and hand back to you after N rounds |
 | `--block LIST` | `blocker,major` | Severities that block approval |
@@ -79,7 +83,7 @@ By default each agent is a headless `claude -p` call on your Claude Code login, 
 | `--out DIR` | `<repo>/.reviewloop` | Where reports and backups go |
 | `-y`, `--yes` | off | Don't ask before the fixer edits files |
 
-Exit codes: `0` approved, nothing to review, or report-only; `1` not converged (blocking findings remain); `2` usage error. This lets you use it in scripts or CI, e.g. `reviewloop -y --check "pytest -q" && git commit`.
+Exit codes: `0` approved, nothing to review, or report-only; `1` not converged (blocking findings remain) or triage aborted; `2` usage error. This lets you use it in scripts or CI, e.g. `reviewloop -y --check "pytest -q" && git commit`.
 
 ## How it converges
 
@@ -87,6 +91,20 @@ Exit codes: `0` approved, nothing to review, or report-only; `1` not converged (
 - **Re-reviews check earlier findings.** From round 2 on, each reviewer gets its own open findings plus the diff of the latest fixes. It marks each finding resolved or still open, and only adds new issues.
 - **The overseer settles conflicts.** Priority is safety > security > readability. Findings it closes as `wont_fix` (each with a reason) are not raised again. It cannot defer a blocking finding.
 - **Hard limits.** `--max-rounds` (default 4), and any failing `--check` blocks approval.
+
+## Triage
+
+With `--triage`, you make the overseer's decisions yourself. After round 1, the loop lists every finding, most severe first, and you mark each one:
+
+- **Fix:** the fixer works on it. It stays open until a reviewer confirms it's resolved, and you aren't asked about it again.
+- **Skip:** closes it without changing the code.
+- **False positive:** closes it and records that it wasn't a real problem.
+
+Skipped and false positive findings stop blocking approval, even blockers, and reviewers won't raise them again unless the fixes make them materially worse. The report lists them under their own headings, so an approved run can still include blockers you chose to close.
+
+The overseer never runs in this mode. If a later round finds something new, you're asked about those findings too, except in the final round, because no review would be left to verify a fix. Failing `--check` commands still block approval and go to the fixer.
+
+Pressing Ctrl-C or Ctrl-D at a prompt stops the run with exit code `1`. The fixer doesn't run that round, and the report keeps the findings and the decisions you've made.
 
 ## Custom reviewers
 
