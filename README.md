@@ -89,7 +89,7 @@ Exit codes: `0` approved, nothing to review, or report-only; `1` not converged (
 
 - **Severity gating.** Only `blocker` and `major` findings block approval (`--block` changes this). Minor issues and nits get reported but never hold up the loop.
 - **Re-reviews check earlier findings.** From round 2 on, each reviewer gets its own open findings plus the diff of the latest fixes. It marks each finding resolved or still open, and only adds new issues.
-- **The overseer settles conflicts.** Priority is safety > security > readability. Findings it closes as `wont_fix` (each with a reason) are not raised again. It cannot defer a blocking finding.
+- **The overseer settles conflicts.** Priority is safety > security > readability. Findings it closes as `wont_fix` (each with a reason) are not raised again. It cannot defer a blocking finding or close a blocker as `wont_fix`. A blocker the fixer can't resolve stops the run at the round limit, and you can close it yourself with `--triage`.
 - **Hard limits.** `--max-rounds` (default 4), and any failing `--check` blocks approval.
 
 ## Triage
@@ -99,12 +99,26 @@ With `--triage`, you make the overseer's decisions yourself. After round 1, the 
 - **Fix:** the fixer works on it. It stays open until a reviewer confirms it's resolved, and you aren't asked about it again.
 - **Skip:** closes it without changing the code.
 - **False positive:** closes it and records that it wasn't a real problem.
+- **Won't fix:** closes it and records that it's real but you accept it. You're asked for a one-line reason.
 
-Skipped and false positive findings stop blocking approval, even blockers, and reviewers won't raise them again unless the fixes make them materially worse. The report lists them under their own headings, so an approved run can still include blockers you chose to close.
+Findings closed in any of these ways stop blocking approval, even blockers, and reviewers won't raise them again during the run unless the fixes make them materially worse. The report lists them under their own headings, so an approved run can still include blockers you chose to close.
 
 The overseer never runs in this mode. If a later round finds something new, you're asked about those findings too, except in the final round, because no review would be left to verify a fix. Failing `--check` commands still block approval and go to the fixer.
 
 Pressing Ctrl-C or Ctrl-D at a prompt stops the run with exit code `1`. The fixer doesn't run that round, and the report keeps the findings and the decisions you've made.
+
+## Suppressions
+
+When you mark a finding as a false positive or won't fix in triage, the decision is saved to `.reviewloop/suppressions.json`, so later runs don't raise it again. Skipped findings aren't saved, because skipping only means not now. The overseer's `wont_fix` is saved only for severities that don't block approval (see `--block`), so only your decisions can suppress anything blocking. If you pass `--out`, the file lives in that directory instead.
+
+Later runs use the file in two ways:
+
+- **Reviewers are told.** Each reviewer gets its own earlier dismissals for the files under review, and is asked not to report them again unless the code has changed so that the reason no longer holds.
+- **Exact repeats are filtered.** If a reviewer still reports a finding it reported before, with the same title on the same file and the flagged line unchanged, the finding is marked suppressed. It doesn't block approval or prompt you, but the report still lists it.
+
+An overseer dismissal never covers anything that blocks approval: if a finding it closed comes back at a blocking severity, or `--block` now includes that severity, it isn't filtered. Your own decisions hold at any severity. Each entry records `decided_by`, `severity` and `reason`, so you can check them. To bring a finding back, delete its entry; to start over, delete the file. If the file is malformed, the run stops with exit code `2` before any review starts, and the file isn't changed.
+
+The file is per clone, because `.reviewloop` ignores itself in git.
 
 ## Custom reviewers
 
