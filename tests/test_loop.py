@@ -263,14 +263,62 @@ def test_false_positive_is_not_raised_again_on_next_run(repo):
     assert "marked false positive in triage" in text
 
 
-def test_overseer_wont_fix_is_suppressed_on_next_run(repo):
-    run(repo, WontFixLLM(severity="major"))
+def test_overseer_wont_fix_on_a_minor_is_suppressed_on_next_run(repo):
+    # A failing check makes the overseer run, since a minor alone would be approved.
+    run(repo, WontFixLLM(severity="minor", fixer_edit_old="no such text"), checks=["false"], max_rounds=2)
     assert saved(repo)[0]["decided_by"] == "overseer"
     assert saved(repo)[0]["reason"] == "ORM escapes it"
 
-    outcome = run(repo, TriageLLM(severity="major"))  # would fail the test if the overseer ran
+    outcome = run(repo, TriageLLM(severity="minor"))
     assert outcome.status == "approved"
     assert outcome.findings["SEC-1"].status == "suppressed"
+
+
+def test_overseer_wont_fix_on_a_major_closes_it_but_is_not_saved(repo):
+    assert run(repo, WontFixLLM(severity="major")).findings["SEC-1"].status == "wont_fix"
+    assert not suppressions_file(repo).exists()
+
+    outcome = triage(repo, TriageLLM(severity="major"), "s")  # prompts again
+    assert outcome.findings["SEC-1"].status == "skipped"
+
+
+@pytest.mark.parametrize("answer", ["w", "W", "wont fix", "won't fix"])
+def test_human_wont_fix_is_saved_with_reason_and_suppressed(repo, answer):
+    outcome = triage(repo, TriageLLM(), answer, "accepted risk, internal tool")
+    assert outcome.status == "approved"
+    assert outcome.findings["SEC-1"].status == "accepted"
+    assert outcome.rounds[0].decisions[0]["action"] == "wont_fix"
+    assert (repo / "app.py").read_text() == BUGGY
+    assert saved(repo)[0]["decided_by"] == "human"
+    assert "accepted risk, internal tool" in saved(repo)[0]["reason"]
+    text = report.write(outcome, repo / ".reviewloop", Usage()).read_text()
+    assert "## Won't fix (you) (1)" in text
+    assert "accepted risk, internal tool" in text
+
+    llm = TriageLLM()
+    next_run = triage(repo, llm)
+    assert next_run.findings["SEC-1"].status == "suppressed"
+    assert "accepted risk, internal tool" in suppressed_block(llm.review_prompts[0])
+
+
+def test_human_wont_fix_needs_a_reason(repo):
+    outcome = triage(repo, TriageLLM(), "w", "", "   ", "accepted risk")
+    assert outcome.findings["SEC-1"].status == "accepted"
+    assert "accepted risk" in saved(repo)[0]["reason"]
+
+
+def test_abort_at_reason_prompt_saves_nothing(repo):
+    outcome = triage(repo, TriageLLM(), "w", EOFError())
+    assert outcome.status == "triage_aborted"
+    assert outcome.findings["SEC-1"].status == "open"
+    assert not suppressions_file(repo).exists()
+
+
+def test_approved_headline_does_not_claim_reviewers_are_satisfied(repo):
+    outcome = triage(repo, TriageLLM(), "s")
+    text = report.write(outcome, repo / ".reviewloop", Usage()).read_text()
+    assert "no blocking findings remain" in text
+    assert "every reviewer is satisfied" not in text
 
 
 def test_skip_is_not_saved(repo):
@@ -351,10 +399,26 @@ def test_blocker_the_fixer_cannot_resolve_goes_to_a_human(repo):
     assert outcome.findings["SEC-1"].status == "open"
 
 
-def test_overseer_dismissal_of_a_major_does_not_cover_a_blocker(repo):
-    run(repo, WontFixLLM(severity="major"))
-    assert saved(repo)[0]["decided_by"] == "overseer"
-    assert triage(repo, TriageLLM(severity="blocker"), "s").findings["SEC-1"].status == "skipped"
+def write_overseer_entry(repo, severity):
+    suppressions_file(repo).parent.mkdir()
+    suppressions_file(repo).write_text(json.dumps({"version": 1, "suppressions": [{
+        "reviewer": "security", "severity": severity, "file": "app.py", "title": "SQL injection via name",
+        "detail": "d", "code": BUGGY.splitlines()[1].strip(), "decided_by": "overseer", "reason": "r",
+        "decided_at": "2026-11-02"}]}))
+
+
+@pytest.mark.parametrize("reported", ["major", "blocker"])
+def test_overseer_dismissal_of_a_minor_does_not_cover_a_blocking_finding(repo, reported):
+    write_overseer_entry(repo, "minor")
+    assert triage(repo, TriageLLM(severity=reported), "s").findings["SEC-1"].status == "skipped"
+
+
+def test_overseer_dismissal_stops_applying_when_block_includes_its_severity(repo):
+    write_overseer_entry(repo, "minor")
+    llm = TriageLLM(severity="minor")
+    outcome = triage(repo, llm, "s", blocking={"blocker", "major", "minor"})
+    assert outcome.findings["SEC-1"].status == "skipped"
+    assert suppressed_block(llm.review_prompts[0]) == ""
 
 
 def test_human_dismissal_of_a_major_covers_a_blocker(repo):

@@ -21,8 +21,9 @@ TRIAGE_ANSWERS = {
     "f": "fix", "fix": "fix",
     "s": "skip", "skip": "skip",
     "p": "false_positive", "fp": "false_positive", "false positive": "false_positive",
+    "w": "wont_fix", "wont fix": "wont_fix", "won't fix": "wont_fix",
 }
-TRIAGE_STATUS = {"skip": "skipped", "false_positive": "false_positive"}
+TRIAGE_STATUS = {"skip": "skipped", "false_positive": "false_positive", "wont_fix": "accepted"}
 CLOSED_STATUSES = ("wont_fix", "deferred", *TRIAGE_STATUS.values())
 
 
@@ -215,7 +216,7 @@ class ReviewLoop:
         closed = [f for f in mine if f.status in CLOSED_STATUSES]
         parts = [rendered, f"\nThis is review round {n}."]
         dismissed = [s for s in self.suppressions
-                     if s.reviewer == r.name and s.file in files and s.covers(s.severity)]
+                     if s.reviewer == r.name and s.file in files and s.covers(s.severity, self.cfg.blocking)]
         if dismissed:
             parts.append("<suppressed_findings>")
             parts += [s.prompt_line() + "\n" for s in dismissed]
@@ -252,7 +253,7 @@ class ReviewLoop:
             finding = Finding(id=fid, reviewer=r.name, round_found=n, history=[f"r{n}: found"], **item)
             self.findings[fid] = finding
             code = suppressions.code_at(files, finding.file, finding.line)
-            match = next((s for s in self.suppressions if s.covers(finding.severity)
+            match = next((s for s in self.suppressions if s.covers(finding.severity, self.cfg.blocking)
                           and s.matches(r.name, finding.file, finding.title, code)), None)
             if match:
                 finding.status = "suppressed"
@@ -298,26 +299,38 @@ class ReviewLoop:
         for i, f in enumerate(undecided, 1):
             self.log(f"\n  ({i}/{len(undecided)}) {f.full()}")
             action = self._ask_action()
-            rl.decisions.append({"id": f.id, "action": action, "reason": "marked in triage", "guidance": ""})
-            f.history.append(f"r{n}: you marked {action.replace('_', ' ')}")
+            reason = self._ask_reason() if action == "wont_fix" else ""
+            label = "won't fix" if action == "wont_fix" else action.replace("_", " ")
+            note = f"marked {label} in triage" + (f": {reason}" if reason else "")
+            rl.decisions.append({"id": f.id, "action": action, "reason": note, "guidance": ""})
+            f.history.append(f"r{n}: you {note}")
             if action == "fix":
                 self.marked_fix.add(f.id)
             else:
                 f.status = TRIAGE_STATUS[action]
-            if action == "false_positive":
-                self._remember(f, ctx.files, "human", "marked false positive in triage")
+            if action in ("false_positive", "wont_fix"):
+                self._remember(f, ctx.files, "human", note)
         return [(f, "") for f in self.findings.values() if f.status == "open" and f.id in self.marked_fix]
+
+    def _read(self, prompt: str) -> str:
+        try:
+            return self.ask(prompt).strip()
+        except (EOFError, KeyboardInterrupt) as e:
+            raise TriageAborted from e
 
     def _ask_action(self) -> str:
         while True:
-            try:
-                answer = self.ask("  [f]ix, [s]kip, false [p]ositive? ")
-            except (EOFError, KeyboardInterrupt) as e:
-                raise TriageAborted from e
-            action = TRIAGE_ANSWERS.get(answer.strip().lower())
+            action = TRIAGE_ANSWERS.get(self._read("  [f]ix, [s]kip, false [p]ositive, [w]on't fix? ").lower())
             if action:
                 return action
-            self.log("  Please answer f, s or p.")
+            self.log("  Please answer f, s, p or w.")
+
+    def _ask_reason(self) -> str:
+        while True:
+            reason = self._read("  Why won't you fix it? ")
+            if reason:
+                return reason
+            self.log("  Please give a one-line reason.")
 
     # ---- overseer --------------------------------------------------------
 
@@ -361,7 +374,7 @@ class ReviewLoop:
             else:
                 f.status = "wont_fix" if d["action"] == "wont_fix" else "deferred"
                 f.history.append(f"r{n}: overseer {d['action']} — {d['reason']}")
-                if d["action"] == "wont_fix":
+                if d["action"] == "wont_fix" and not blocking:
                     self._remember(f, ctx.files, "overseer", d["reason"])
 
         counts = {a: sum(d["action"] == a for d in rl.decisions) for a in ("fix", "wont_fix", "defer")}

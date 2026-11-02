@@ -8,7 +8,7 @@ from .loop import Outcome
 from .schemas import SEVERITIES
 
 HEADLINES = {
-    "approved": "✅ Approved — every reviewer is satisfied and all checks pass.",
+    "approved": "✅ Approved — no blocking findings remain and all checks pass.",
     "not_converged": "⚠️ Not converged — blocking findings remain after the round limit. Needs a human.",
     "report_only": "📝 Report only — findings were not fixed (--no-fix).",
     "nothing_to_review": "Nothing to review — no changes against the base.",
@@ -26,7 +26,8 @@ def write(outcome: Outcome, out_dir: Path, usage) -> Path:
               + (f" · cost: ${usage.cost_usd:.2f}" if usage.cost_usd else ""))
 
     for title, statuses in [("Open", {"open"}), ("Won't fix (overseer)", {"wont_fix"}),
-                            ("Skipped (you)", {"skipped"}), ("False positive (you)", {"false_positive"}),
+                            ("Won't fix (you)", {"accepted"}), ("Skipped (you)", {"skipped"}),
+                            ("False positive (you)", {"false_positive"}),
                             ("Suppressed (dismissed in an earlier decision)", {"suppressed"}),
                             ("Deferred", {"deferred"}), ("Resolved", {"resolved"})]:
         group = [f for f in findings if f.status in statuses]

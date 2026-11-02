@@ -77,7 +77,7 @@ class Finding:
     detail: str
     suggestion: str
     round_found: int
-    status: str = "open"  # open | resolved | wont_fix | deferred | skipped | false_positive | suppressed
+    status: str = "open"  # open | resolved | wont_fix | deferred | skipped | false_positive | accepted | suppressed
     history: list[str] = field(default_factory=list)
 
     def is_blocking(self, blocking: set[str]) -> bool:

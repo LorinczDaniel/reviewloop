@@ -21,9 +21,9 @@ class Suppression:
     reason: str
     decided_at: str
 
-    def covers(self, severity: str) -> bool:
-        """Whether this entry can dismiss a finding of this severity: only a human can dismiss a blocker."""
-        return self.decided_by == "human" or "blocker" not in (self.severity, severity)
+    def covers(self, severity: str, blocking: set[str]) -> bool:
+        """Whether this entry can dismiss a finding of this severity: only a human can dismiss anything blocking."""
+        return self.decided_by == "human" or not {self.severity, severity} & (blocking | {"blocker"})
 
     def matches(self, reviewer: str, file: str, title: str, code: str) -> bool:
         """True for the same finding on the same line of code.
@@ -41,7 +41,7 @@ class Suppression:
 
     def prompt_line(self) -> str:
         code = f"\nCode: {self.code}" if self.code else ""
-        return f"{self.file} — {self.title}\n{self.detail}{code}\nDismissed by {self.decided_by}: {self.reason}"
+        return f"({self.severity}) {self.file} — {self.title}\n{self.detail}{code}\nDismissed by {self.decided_by}: {self.reason}"
 
 
 def _normalize(title: str) -> str:
