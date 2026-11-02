@@ -12,7 +12,7 @@ from .loop import Config, ReviewLoop, load_reviewers
 from .schemas import SEVERITIES
 
 FAST_MODEL = "claude-sonnet-5-5"
-EXIT = {"approved": 0, "nothing_to_review": 0, "report_only": 0, "not_converged": 1}
+EXIT = {"approved": 0, "nothing_to_review": 0, "report_only": 0, "not_converged": 1, "triage_aborted": 1}
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -29,6 +29,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--check", action="append", default=[], metavar="CMD",
                    help="shell command that must pass, e.g. 'pytest -q' (repeatable)")
     p.add_argument("--no-fix", action="store_true", help="review once and report, without changing any files")
+    p.add_argument("--triage", action="store_true",
+                   help="mark each finding fix, skip or false positive yourself, instead of running the overseer")
     p.add_argument("--reviewers", help="comma-separated subset of reviewers to run (default: all)")
     p.add_argument("--reviewer-dir", type=Path, help="directory of extra reviewer prompts (<name>.md)")
     p.add_argument("--backend", choices=["claude-code", "api"], default="claude-code",
@@ -58,6 +60,15 @@ def main(argv=None) -> int:
         print(f"error: --block must be a subset of {SEVERITIES}", file=sys.stderr)
         return 2
 
+    if args.triage:
+        problem = ("--triage can't be combined with --no-fix, because no fixer runs" if args.no_fix
+                   else "--triage needs --max-rounds of at least 2, so a later round can verify the fixes" if args.max_rounds < 2
+                   else "--triage needs an interactive terminal" if not sys.stdin.isatty()
+                   else None)
+        if problem:
+            print(f"error: {problem}", file=sys.stderr)
+            return 2
+
     try:
         reviewers = load_reviewers(args.reviewers.split(",") if args.reviewers else None, args.reviewer_dir)
     except ValueError as e:
@@ -74,7 +85,7 @@ def main(argv=None) -> int:
             return 2
 
     cfg = Config(repo=repo, base=args.base, max_rounds=args.max_rounds, blocking=blocking,
-                 checks=args.check, fix=not args.no_fix, out_dir=out_dir, explore=args.explore)
+                 checks=args.check, fix=not args.no_fix, out_dir=out_dir, explore=args.explore, triage=args.triage)
     model = args.model or (FAST_MODEL if args.fast else DEFAULT_MODEL)
     effort = args.effort or ("medium" if args.fast else "high")
     try:
