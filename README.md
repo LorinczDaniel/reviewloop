@@ -107,6 +107,24 @@ The overseer never runs in this mode. If a later round finds something new, you'
 
 Pressing Ctrl-C or Ctrl-D at a prompt stops the run with exit code `1`. The fixer doesn't run that round, and the report keeps the findings and the decisions you've made.
 
+## Project rules
+
+Every agent gets your project's conventions in its prompt, so reviewers don't have to guess at your style. These files are loaded from the repo root if they exist, most specific first:
+
+1. `.reviewloop/rules.md`
+2. `CLAUDE.md`
+3. `CONTRIBUTING.md`
+
+The log shows which files were loaded and why any were left out. Each file is capped at 20,000 bytes.
+
+**A change can't rewrite its own rules.** Tracked files are read from `--base`, so with the default base, uncommitted edits to `CLAUDE.md` don't count until you commit them. A rule file added by the change under review isn't loaded at all. Symlinks aren't followed, and neither are `@` imports inside `CLAUDE.md`.
+
+`.reviewloop/rules.md` is the place for rules meant only for reviewloop. `.reviewloop` ignores itself in git, so the file stays local to your clone and works without committing it. To share it, run `git add -f .reviewloop/rules.md`; it's then treated like any other tracked file.
+
+Rules inform the agents, but they can't narrow a review, lower a severity or change this process.
+
+With the `claude-code` backend, agents run with `--setting-sources user`. Your own `~/.claude` settings still apply, including your personal `CLAUDE.md`, but project-level Claude Code settings, hooks and auto-loaded `CLAUDE.md` files don't. With `--explore`, reviewers can still read any file in the working tree, including an edited `CLAUDE.md`.
+
 ## Suppressions
 
 When you mark a finding as a false positive or won't fix in triage, the decision is saved to `.reviewloop/suppressions.json`, so later runs don't raise it again. Skipped findings aren't saved, because skipping only means not now. The overseer's `wont_fix` is saved only for severities that don't block approval (see `--block`), so only your decisions can suppress anything blocking. If you pass `--out`, the file lives in that directory instead.
