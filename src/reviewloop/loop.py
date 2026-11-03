@@ -241,7 +241,7 @@ class ReviewLoop:
 
     def _record_review(self, r: Reviewer, n: int, result: dict, rl: RoundLog, took: str, files: dict[str, str]) -> None:
         rl.summaries[r.name] = result["summary"]
-        resolved = suppressed = dropped = 0
+        resolved = suppressed = dropped = unverified = 0
         for prev in result["previous"]:
             f = self.findings.get(prev["id"])
             if not f or f.reviewer != r.name or f.status != "open":
@@ -257,18 +257,18 @@ class ReviewLoop:
             finding = Finding(id=fid, reviewer=r.name, round_found=n, history=[f"r{n}: found"], **item)
             self.findings[fid] = finding
             located = context.locate_quote(self.cfg.repo, self.cfg.base, files, finding.file, finding.quote, finding.line)
-            if located is None and finding.severity != "blocker":
+            shown = " ".join(finding.quote.split())[:200] or "(empty)"
+            if located is None and finding.severity not in self.cfg.blocking | {"blocker"}:
                 finding.status = "dropped"
-                shown = " ".join(finding.quote.split())[:200] or "(empty)"
                 finding.history.append(f"r{n}: dropped, quote not found in {finding.file}: {shown}")
                 self.log(f"  {r.name}: dropped {finding.brief()}: quote not found")
                 dropped += 1
                 continue
-            if located is None:  # never drop a blocker: it stays open until a human decides
+            if located is None:  # a failed text match never removes something that blocks approval
                 finding.verified = False
-                shown = " ".join(finding.quote.split())[:200] or "(empty)"
                 finding.history.append(f"r{n}: unverified, quote not found in {finding.file}: {shown}")
                 self.log(f"  {r.name}: kept {finding.brief()}: quote not found")
+                unverified += 1
             else:
                 finding.line = located
             code = suppressions.code_at(files, finding.file, finding.line)
@@ -284,7 +284,8 @@ class ReviewLoop:
         still_open = [f for f in self.findings.values() if f.reviewer == r.name and f.status == "open"]
         blocking = sum(f.severity in self.cfg.blocking for f in still_open)
         verdict = "approves" if not blocking else f"requests changes ({blocking} blocking)"
-        note = (f", {suppressed} suppressed" if suppressed else "") + (f", {dropped} dropped" if dropped else "")
+        counts = {"suppressed": suppressed, "dropped": dropped, "unverified": unverified}
+        note = "".join(f", {count} {label}" for label, count in counts.items() if count)
         self.log(f"  {r.name}: {verdict}; {len(still_open)} open, {resolved} resolved this round{note} ({took})")
 
     # ---- suppressions ----------------------------------------------------

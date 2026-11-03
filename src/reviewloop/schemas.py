@@ -81,7 +81,7 @@ class Finding:
     status: str = "open"  # open | resolved | wont_fix | deferred | skipped | false_positive | accepted | suppressed | dropped
     history: list[str] = field(default_factory=list)
     quote: str = ""
-    verified: bool = True  # False for a blocker whose quote wasn't found; it stays open for a human
+    verified: bool = True  # False for a blocking finding whose quote wasn't found
 
     def is_blocking(self, blocking: set[str]) -> bool:
         return self.status == "open" and self.severity in blocking
