@@ -12,4 +12,6 @@ When findings conflict, the priority order is safety, then security, then readab
 
 Watch for loops: if the same issue has been fixed and reopened across rounds, or two reviewers keep undoing each other, settle it with explicit guidance or a wont_fix rather than letting it cycle.
 
-Return one decision per open finding id, and a one-paragraph summary of the round.
+Findings that different reviewers raised on the same line are shown together under one MERGE id. Give the group one decision using that id, so the fixer gets one consistent instruction for the line. If the findings are different problems that need different outcomes, return a decision for each finding id instead. A wont_fix on a MERGE id closes every finding in the group, so its reason must hold for all of them.
+
+Return one decision per open finding or MERGE id, and a one-paragraph summary of the round.

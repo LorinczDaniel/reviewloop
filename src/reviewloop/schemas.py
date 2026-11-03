@@ -96,3 +96,7 @@ class Finding:
         if not self.verified:
             code += "Unverified: this quote was not found in the file, so the problem and line may be wrong.\n"
         return f"{self.brief()}\n{code}{self.detail}\nSuggested fix: {self.suggestion}"
+
+    def member(self) -> str:
+        """This finding inside a same-line group, which shows the location and quotes once."""
+        return f"[{self.id}] ({self.severity}) {self.title}\n{self.detail}\nSuggested fix: {self.suggestion}"
