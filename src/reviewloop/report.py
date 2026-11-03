@@ -16,6 +16,10 @@ HEADLINES = {
 }
 
 
+def _group(finding) -> str:
+    return "unverified" if finding.status == "open" and not finding.verified else finding.status
+
+
 def write(outcome: Outcome, out_dir: Path, usage) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     findings = sorted(outcome.findings.values(), key=lambda f: (SEVERITIES.index(f.severity), f.id))
@@ -25,12 +29,14 @@ def write(outcome: Outcome, out_dir: Path, usage) -> Path:
               f"tokens in/out: {usage.input_tokens:,}/{usage.output_tokens:,}"
               + (f" · cost: ${usage.cost_usd:.2f}" if usage.cost_usd else ""))
 
-    for title, statuses in [("Open", {"open"}), ("Won't fix (overseer)", {"wont_fix"}),
+    for title, statuses in [("Open", {"open"}), ("Unverified (quote not found)", {"unverified"}),
+                            ("Won't fix (overseer)", {"wont_fix"}),
                             ("Won't fix (you)", {"accepted"}), ("Skipped (you)", {"skipped"}),
                             ("False positive (you)", {"false_positive"}),
                             ("Suppressed (dismissed in an earlier decision)", {"suppressed"}),
+                            ("Dropped (quote not found)", {"dropped"}),
                             ("Deferred", {"deferred"}), ("Resolved", {"resolved"})]:
-        group = [f for f in findings if f.status in statuses]
+        group = [f for f in findings if _group(f) in statuses]
         if not group:
             continue
         md += ["", f"## {title} ({len(group)})", ""]

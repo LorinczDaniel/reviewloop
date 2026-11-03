@@ -87,6 +87,7 @@ Exit codes: `0` approved, nothing to review, or report-only; `1` not converged (
 
 ## How it converges
 
+- **Findings must quote the code.** Each finding includes the exact code it's about, and its line number is corrected to where that code actually is. What happens when a quote isn't in the file, or in the base version for code the change removed, depends on severity. Blockers and anything in `--block` stay open and marked `unverified`: they still block approval, and the report lists them in their own "Unverified" group. Other findings are dropped: they don't prompt you or reach the fixer, but they're logged and listed in the report. Indentation, blank lines and leading diff markers (`+`/`-`) are ignored when matching.
 - **Severity gating.** Only `blocker` and `major` findings block approval (`--block` changes this). Minor issues and nits get reported but never hold up the loop.
 - **Re-reviews check earlier findings.** From round 2 on, each reviewer gets its own open findings plus the diff of the latest fixes. It marks each finding resolved or still open, and only adds new issues.
 - **The overseer settles conflicts.** Priority is safety > security > readability. Findings it closes as `wont_fix` (each with a reason) are not raised again. It cannot defer a blocking finding or close a blocker as `wont_fix`. A blocker the fixer can't resolve stops the run at the round limit, and you can close it yourself with `--triage`.

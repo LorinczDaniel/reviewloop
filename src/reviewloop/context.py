@@ -4,6 +4,8 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .edits import resolve_in_repo
+
 MAX_FILE_BYTES = 200_000
 MAX_CHECK_OUTPUT = 8_000
 MAX_RULES_BYTES = 20_000
@@ -71,6 +73,57 @@ def load_rules(repo: Path, base: str, changed: list[str]) -> tuple[dict[str, str
         if text:
             rules[rel] = text
     return rules, notes
+
+
+def _quote_lines(quote: str, text: str) -> list[int]:
+    """Line numbers where the quote starts, ignoring indentation and blank lines.
+
+    The quote can start partway through its first line and end partway through its last.
+    """
+    want = [line.strip() for line in quote.splitlines() if line.strip()]
+    if not want:
+        return []
+    numbered = [(i, s) for i, line in enumerate(text.splitlines(), 1) if (s := line.strip())]
+    hits = []
+    for start in range(len(numbered) - len(want) + 1):
+        window = [s for _, s in numbered[start:start + len(want)]]
+        if len(want) == 1:
+            found = want[0] in window[0]
+        else:
+            found = (window[0].endswith(want[0]) and window[-1].startswith(want[-1])
+                     and window[1:-1] == want[1:-1])
+        if found:
+            hits.append(numbered[start][0])
+    return hits
+
+
+def locate_quote(repo: Path, base: str, files: dict[str, str], file: str, quote: str, line: int) -> int | None:
+    """Find where a finding's quote is.
+
+    Returns the closest line in the current file, 0 if the quote is only in the
+    base version (code the change removed), or None if it isn't in either.
+    """
+    unmarked = "\n".join(l[1:] if l.startswith(("+", "-")) else l for l in quote.splitlines())
+    candidates = [quote, unmarked]  # reviewers sometimes copy the markers from the diff
+
+    current = files.get(file)
+    if current is None:  # not sent to the reviewer: too large, or found through --explore
+        path = resolve_in_repo(repo, file)
+        ignored = subprocess.run(["git", "check-ignore", "-q", "--", file], cwd=repo).returncode == 0
+        if path is not None and path.is_file() and not ignored:  # never open secrets like .env
+            current = path.read_bytes().decode("utf-8", errors="replace")
+    for candidate in candidates:
+        if hits := _quote_lines(candidate, current or ""):
+            return min(hits, key=lambda hit: abs(hit - line))
+
+    if resolve_in_repo(repo, file) is None:
+        return None
+    result = subprocess.run(["git", "show", f"{base}:{file}"], cwd=repo, capture_output=True)
+    if result.returncode == 0:
+        before = result.stdout.decode("utf-8", errors="replace")
+        if any(_quote_lines(candidate, before) for candidate in candidates):
+            return 0
+    return None
 
 
 @dataclass

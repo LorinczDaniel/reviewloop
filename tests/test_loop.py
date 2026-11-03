@@ -51,7 +51,7 @@ class FakeLLM:
                 return _empty_review()
             if "<your_open_findings>" not in user:
                 return {"summary": "SQL injection", "previous": [], "findings": [{
-                    "severity": "blocker", "file": "app.py", "line": 2,
+                    "severity": "blocker", "file": "app.py", "line": 2, "quote": "return db.execute(",
                     "title": "SQL injection via name", "detail": "f-string query",
                     "suggestion": "use a parameterized query",
                 }]}
@@ -179,7 +179,7 @@ def test_triage_asks_about_findings_from_later_rounds(repo):
         def structured(self, system, user, schema, tools=None):
             result = super().structured(system, user, schema, tools)
             if schema is REVIEW_SCHEMA and "Your area is security" in system and "<your_open_findings>" in user:
-                result["findings"] = [{"severity": "major", "file": "app.py", "line": 1, "title": "new issue",
+                result["findings"] = [{"severity": "major", "file": "app.py", "line": 1, "quote": "def get_user", "title": "new issue",
                                        "detail": "d", "suggestion": "s"}]
             return result
 
@@ -210,7 +210,7 @@ def test_closed_findings_reach_reviewers_and_report(repo):
         def structured(self, system, user, schema, tools=None):
             result = super().structured(system, user, schema, tools)
             if schema is REVIEW_SCHEMA and "Your area is security" in system and "<your_open_findings>" not in user:
-                result["findings"].append({"severity": "major", "file": "app.py", "line": 1, "title": "not real",
+                result["findings"].append({"severity": "major", "file": "app.py", "line": 1, "quote": "def get_user", "title": "not real",
                                            "detail": "d", "suggestion": "s"})
             return result
 
@@ -361,17 +361,15 @@ def test_title_case_and_spacing_still_match(repo):
     assert triage(repo, RecaseLLM(severity="major")).findings["SEC-1"].status == "suppressed"
 
 
-class NoLineLLM(TriageLLM):
-    def structured(self, system, user, schema, tools=None):
-        result = super().structured(system, user, schema, tools)
-        for finding in result.get("findings", []):
-            finding["line"] = 0
-        return result
-
-
 def test_finding_without_a_line_is_not_filtered_or_saved_twice(repo):
-    triage(repo, NoLineLLM(severity="major"), "p")
-    assert triage(repo, NoLineLLM(severity="major"), "p").findings["SEC-1"].status == "false_positive"
+    # A quote from removed code has no line in the current file.
+    (repo / "app.py").write_text(BUGGY)
+    commit_all(repo)
+    (repo / "app.py").write_text(BUGGY.splitlines()[0] + "\n")
+
+    first = triage(repo, TriageLLM(severity="major"), "p")
+    assert first.findings["SEC-1"].line == 0
+    assert triage(repo, TriageLLM(severity="major"), "p").findings["SEC-1"].status == "false_positive"
     assert len(saved(repo)) == 1
 
 
@@ -465,7 +463,7 @@ def test_abort_keeps_decisions_already_made(repo):
         def structured(self, system, user, schema, tools=None):
             result = super().structured(system, user, schema, tools)
             if schema is REVIEW_SCHEMA and "Your area is security" in system:
-                result["findings"].append({"severity": "major", "file": "app.py", "line": 1, "title": "second",
+                result["findings"].append({"severity": "major", "file": "app.py", "line": 1, "quote": "def get_user", "title": "second",
                                            "detail": "d", "suggestion": "s"})
             return result
 
@@ -487,6 +485,236 @@ def test_malformed_file_stops_the_run_and_is_kept(repo, monkeypatch, capsys, con
     assert cli.main(["--repo", str(repo), "-y"]) == 2
     assert suppressions.FILENAME in capsys.readouterr().err
     assert suppressions_file(repo).read_text() == content
+
+
+class ReportsLLM(TriageLLM):
+    """TriageLLM whose findings have the given fields overridden."""
+
+    def __init__(self, severity="blocker", **fields):
+        super().__init__(severity=severity)
+        self.fields = fields
+
+    def structured(self, system, user, schema, tools=None):
+        result = super().structured(system, user, schema, tools)
+        for finding in result.get("findings", []):
+            finding.update(self.fields)
+        return result
+
+
+def test_finding_with_invented_quote_is_dropped_but_reported(repo):
+    logs = []
+    cfg = Config(repo=repo, out_dir=repo / ".reviewloop", triage=True)
+    llm = ReportsLLM(severity="minor", quote="eval(request.body)")
+    loop = ReviewLoop(cfg, llm, load_reviewers(), log=logs.append, ask=scripted())
+    outcome = loop.run()  # scripted() raises IndexError if this prompts
+
+    assert outcome.status == "approved"
+    assert outcome.findings["SEC-1"].status == "dropped"
+    assert (repo / "app.py").read_text() == BUGGY
+    assert any("dropped [SEC-1]" in line for line in logs)
+    text = report.write(outcome, repo / ".reviewloop", Usage()).read_text()
+    assert "## Dropped (quote not found) (1)" in text
+    assert "eval(request.body)" in text
+
+
+@pytest.mark.parametrize("fields", [{"quote": ""}, {"quote": "  \n "}, {"file": "invented.py"}])
+def test_finding_without_a_usable_quote_or_file_is_dropped(repo, fields):
+    assert triage(repo, ReportsLLM(severity="minor", **fields)).findings["SEC-1"].status == "dropped"
+
+
+@pytest.mark.parametrize("severity", ["blocker", "major"])
+@pytest.mark.parametrize("fields", [{"quote": "eval(request.body)"}, {"quote": ""}, {"file": "invented.py"}])
+def test_blocking_finding_with_unmatched_quote_stays_open_for_a_human(repo, severity, fields):
+    logs = []
+    cfg = Config(repo=repo, out_dir=repo / ".reviewloop", triage=True)
+    llm = ReportsLLM(severity=severity, **fields)
+    outcome = ReviewLoop(cfg, llm, load_reviewers(), log=logs.append, ask=scripted("s")).run()
+    finding = outcome.findings["SEC-1"]
+    assert finding.status == "skipped"  # it reached the human, who closed it
+    assert not finding.verified
+    assert any("Unverified" in line and "unverified" in line for line in logs)
+
+
+def test_unmatched_quote_follows_the_block_setting(repo):
+    major = ReportsLLM(severity="major", quote="not in the file")
+    assert triage(repo, major, blocking={"blocker"}).findings["SEC-1"].status == "dropped"
+
+    minor = ReportsLLM(severity="minor", quote="not in the file")
+    outcome = triage(repo, minor, "s", blocking={"blocker", "major", "minor"})
+    assert outcome.findings["SEC-1"].status == "skipped"
+    assert not outcome.findings["SEC-1"].verified
+
+
+def test_report_groups_unverified_findings_apart_from_open_ones(repo):
+    class OneOfEachLLM(TriageLLM):
+        def structured(self, system, user, schema, tools=None):
+            result = super().structured(system, user, schema, tools)
+            if schema is REVIEW_SCHEMA and "Your area is security" in system and "<your_open_findings>" not in user:
+                result["findings"].append({"severity": "major", "file": "app.py", "line": 1, "quote": "not in the file",
+                                           "title": "no match", "detail": "d", "suggestion": "s"})
+            return result
+
+    outcome = run(repo, OneOfEachLLM(), fix=False)
+    assert outcome.status == "report_only"
+    text = report.write(outcome, repo / ".reviewloop", Usage()).read_text()
+    open_section = text.split("## Open (1)")[1].split("## Unverified (quote not found) (1)")[0]
+    unverified_section = text.split("## Unverified (quote not found) (1)")[1].split("## Round 1")[0]
+    assert "SQL injection via name" in open_section
+    assert "no match" not in open_section
+    assert "no match" in unverified_section
+    assert "(major, unverified)" in unverified_section
+
+
+def test_overseer_can_close_an_unverified_major_without_saving_it(repo):
+    class UnmatchedWontFixLLM(WontFixLLM):
+        def structured(self, system, user, schema, tools=None):
+            result = super().structured(system, user, schema, tools)
+            for finding in result.get("findings", []):
+                finding["quote"] = "not in the file"
+            return result
+
+    outcome = run(repo, UnmatchedWontFixLLM(severity="major"))
+    assert outcome.status == "approved"
+    assert outcome.findings["SEC-1"].status == "wont_fix"
+    assert not outcome.findings["SEC-1"].verified
+    assert not suppressions_file(repo).exists()
+
+
+def test_unmatched_blocker_keeps_its_reported_line(repo):
+    outcome = triage(repo, ReportsLLM(quote="not in the file", line=999), "s")
+    assert outcome.findings["SEC-1"].line == 999
+
+
+def test_unmatched_blocker_blocks_approval_and_is_flagged_to_fixer(repo):
+    llm = RecordingLLM(fixer_edit_old="no such text")
+    original = llm.structured
+
+    def invented(system, user, schema, tools=None):
+        result = original(system, user, schema, tools)
+        for finding in result.get("findings", []):
+            finding["quote"] = "not in the file"
+        return result
+
+    llm.structured = invented
+    outcome = run(repo, llm, max_rounds=2)
+    assert outcome.status == "not_converged"
+    assert outcome.findings["SEC-1"].status == "open"
+    assert "Unverified" in llm.prompts["fixer"][0]
+    text = report.write(outcome, repo / ".reviewloop", Usage()).read_text()
+    assert "(blocker, unverified)" in text
+
+
+def test_human_can_dismiss_an_unverified_blocker_for_later_runs(repo):
+    triage(repo, ReportsLLM(quote="not in the file"), "p")
+    outcome = triage(repo, ReportsLLM(quote="not in the file"))
+    assert outcome.status == "approved"
+    assert outcome.findings["SEC-1"].status == "suppressed"
+
+
+def test_dropped_finding_never_reaches_fixer_or_later_review_prompts(repo):
+    llm = RecordingLLM()
+    original = llm.structured
+
+    def invented(system, user, schema, tools=None):
+        result = original(system, user, schema, tools)
+        for finding in result.get("findings", []):
+            finding.update(severity="minor", quote="not in the file")
+        return result
+
+    llm.structured = invented
+    outcome = run(repo, llm, checks=["false"], max_rounds=2)  # the check forces a second round
+    assert outcome.findings["SEC-1"].status == "dropped"
+    assert not any("[SEC-1]" in prompt for prompts in llm.prompts.values() for prompt in prompts)
+
+
+def test_wrong_line_number_is_corrected(repo):
+    outcome = triage(repo, ReportsLLM(line=999), "s")
+    assert outcome.findings["SEC-1"].line == 2
+
+
+def test_correct_line_makes_suppression_match_despite_a_wrong_line(repo):
+    triage(repo, ReportsLLM(severity="major"), "p")
+    assert triage(repo, ReportsLLM(severity="major", line=999)).findings["SEC-1"].status == "suppressed"
+
+
+def locate(repo, file_text, quote, line=0):
+    return context.locate_quote(repo, "HEAD", {"f.py": file_text}, "f.py", quote, line)
+
+
+def test_quote_uses_the_occurrence_closest_to_the_reported_line(repo):
+    text = "x = 1\ny = 2\nx = 1\ny = 2\nx = 1\n"
+    assert locate(repo, text, "x = 1", line=4) == 3
+    assert locate(repo, text, "x = 1", line=5) == 5
+
+
+@pytest.mark.parametrize("quote", [
+    "return value",  # part of a line
+    "        return value",  # different indentation
+    "+    return value",  # marker copied from the diff
+    "if ok:\n    return value",  # several lines
+    "if ok:\n\n    return value",  # a blank line the file doesn't have
+    "+if ok:\n+    return value",  # markers on several lines
+])
+def test_formatting_differences_still_match(repo, quote):
+    assert locate(repo, "def f():\n    if ok:\n        return value\n", quote) in (2, 3)
+
+
+@pytest.mark.parametrize("quote", [
+    "return values",
+    "if ok:\n    return other",
+    "return\nvalue",
+])
+def test_different_code_does_not_match(repo, quote):
+    assert locate(repo, "def f():\n    if ok:\n        return value\n", quote) is None
+
+
+def test_quote_starting_with_a_real_minus_matches_as_written(repo):
+    assert locate(repo, "a = 1\n-x\n", "-x") == 2
+
+
+def test_finding_about_removed_code_is_kept(repo):
+    (repo / "app.py").write_text("def f(user):\n    check_auth(user)\n    return 1\n")
+    commit_all(repo)
+    (repo / "app.py").write_text("def f(user):\n    return 1\n")
+
+    outcome = triage(repo, ReportsLLM(quote="check_auth(user)", line=2), "s")
+    assert outcome.findings["SEC-1"].status == "skipped"
+    assert outcome.findings["SEC-1"].line == 0
+
+
+def test_finding_about_a_deleted_file_is_kept(repo):
+    (repo / "gone.py").write_text("check_auth(user)\n")
+    commit_all(repo)
+    (repo / "gone.py").unlink()
+    assert context.locate_quote(repo, "HEAD", {}, "gone.py", "check_auth(user)", 1) == 0
+
+
+def test_quote_in_a_file_too_large_to_send_is_checked_on_disk(repo):
+    (repo / "big.py").write_text("target = 1\n" + "x\n" * context.MAX_FILE_BYTES)
+    assert context.locate_quote(repo, "HEAD", {}, "big.py", "target = 1", 0) == 1
+
+
+def test_paths_outside_the_repo_are_never_read(repo):
+    (repo.parent / "secret.txt").write_text("hunter2\n")
+    assert context.locate_quote(repo, "HEAD", {}, "../secret.txt", "hunter2", 1) is None
+    assert context.locate_quote(repo, "HEAD", {}, str(repo.parent / "secret.txt"), "hunter2", 1) is None
+
+
+def test_gitignored_files_are_never_read(repo):
+    (repo / ".gitignore").write_text(".env\n")
+    (repo / ".env").write_text("API_KEY=hunter2\n")
+    assert context.locate_quote(repo, "HEAD", {}, ".env", "API_KEY=hunter2", 1) is None
+
+
+def test_reviewers_must_return_a_quote():
+    assert "quote" in REVIEW_SCHEMA["properties"]["findings"]["items"]["required"]
+
+
+def test_triage_shows_the_quoted_code(repo):
+    logs = []
+    cfg = Config(repo=repo, out_dir=repo / ".reviewloop", triage=True)
+    ReviewLoop(cfg, TriageLLM(), load_reviewers(), log=logs.append, ask=scripted("s")).run()
+    assert any("Quoted code: return db.execute(" in line for line in logs)
 
 
 def commit_all(repo, message="commit"):
