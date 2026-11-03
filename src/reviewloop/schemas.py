@@ -81,14 +81,18 @@ class Finding:
     status: str = "open"  # open | resolved | wont_fix | deferred | skipped | false_positive | accepted | suppressed | dropped
     history: list[str] = field(default_factory=list)
     quote: str = ""
+    verified: bool = True  # False for a blocker whose quote wasn't found; it stays open for a human
 
     def is_blocking(self, blocking: set[str]) -> bool:
         return self.status == "open" and self.severity in blocking
 
     def brief(self) -> str:
         loc = f"{self.file}:{self.line}" if self.line else self.file
-        return f"[{self.id}] ({self.severity}) {loc} — {self.title}"
+        severity = self.severity if self.verified else f"{self.severity}, unverified"
+        return f"[{self.id}] ({severity}) {loc} — {self.title}"
 
     def full(self) -> str:
         code = f"Quoted code: {self.quote}\n" if self.quote else ""
+        if not self.verified:
+            code += "Unverified: this quote was not found in the file, so the problem and line may be wrong.\n"
         return f"{self.brief()}\n{code}{self.detail}\nSuggested fix: {self.suggestion}"

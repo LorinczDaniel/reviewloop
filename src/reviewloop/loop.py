@@ -257,14 +257,20 @@ class ReviewLoop:
             finding = Finding(id=fid, reviewer=r.name, round_found=n, history=[f"r{n}: found"], **item)
             self.findings[fid] = finding
             located = context.locate_quote(self.cfg.repo, self.cfg.base, files, finding.file, finding.quote, finding.line)
-            if located is None:
+            if located is None and finding.severity != "blocker":
                 finding.status = "dropped"
                 shown = " ".join(finding.quote.split())[:200] or "(empty)"
                 finding.history.append(f"r{n}: dropped, quote not found in {finding.file}: {shown}")
                 self.log(f"  {r.name}: dropped {finding.brief()}: quote not found")
                 dropped += 1
                 continue
-            finding.line = located
+            if located is None:  # never drop a blocker: it stays open until a human decides
+                finding.verified = False
+                shown = " ".join(finding.quote.split())[:200] or "(empty)"
+                finding.history.append(f"r{n}: unverified, quote not found in {finding.file}: {shown}")
+                self.log(f"  {r.name}: kept {finding.brief()}: quote not found")
+            else:
+                finding.line = located
             code = suppressions.code_at(files, finding.file, finding.line)
             match = next((s for s in self.suppressions if s.covers(finding.severity, self.cfg.blocking)
                           and s.matches(r.name, finding.file, finding.title, code)), None)

@@ -504,7 +504,8 @@ class ReportsLLM(TriageLLM):
 def test_finding_with_invented_quote_is_dropped_but_reported(repo):
     logs = []
     cfg = Config(repo=repo, out_dir=repo / ".reviewloop", triage=True)
-    loop = ReviewLoop(cfg, ReportsLLM(quote="eval(request.body)"), load_reviewers(), log=logs.append, ask=scripted())
+    llm = ReportsLLM(severity="major", quote="eval(request.body)")
+    loop = ReviewLoop(cfg, llm, load_reviewers(), log=logs.append, ask=scripted())
     outcome = loop.run()  # scripted() raises IndexError if this prompts
 
     assert outcome.status == "approved"
@@ -518,7 +519,49 @@ def test_finding_with_invented_quote_is_dropped_but_reported(repo):
 
 @pytest.mark.parametrize("fields", [{"quote": ""}, {"quote": "  \n "}, {"file": "invented.py"}])
 def test_finding_without_a_usable_quote_or_file_is_dropped(repo, fields):
-    assert triage(repo, ReportsLLM(**fields)).findings["SEC-1"].status == "dropped"
+    assert triage(repo, ReportsLLM(severity="major", **fields)).findings["SEC-1"].status == "dropped"
+
+
+@pytest.mark.parametrize("fields", [{"quote": "eval(request.body)"}, {"quote": ""}, {"file": "invented.py"}])
+def test_blocker_with_unmatched_quote_stays_open_for_a_human(repo, fields):
+    logs = []
+    cfg = Config(repo=repo, out_dir=repo / ".reviewloop", triage=True)
+    outcome = ReviewLoop(cfg, ReportsLLM(**fields), load_reviewers(), log=logs.append, ask=scripted("s")).run()
+    finding = outcome.findings["SEC-1"]
+    assert finding.status == "skipped"  # it reached the human, who closed it
+    assert not finding.verified
+    assert any("Unverified" in line and "unverified" in line for line in logs)
+
+
+def test_unmatched_blocker_keeps_its_reported_line(repo):
+    outcome = triage(repo, ReportsLLM(quote="not in the file", line=999), "s")
+    assert outcome.findings["SEC-1"].line == 999
+
+
+def test_unmatched_blocker_blocks_approval_and_is_flagged_to_fixer(repo):
+    llm = RecordingLLM(fixer_edit_old="no such text")
+    original = llm.structured
+
+    def invented(system, user, schema, tools=None):
+        result = original(system, user, schema, tools)
+        for finding in result.get("findings", []):
+            finding["quote"] = "not in the file"
+        return result
+
+    llm.structured = invented
+    outcome = run(repo, llm, max_rounds=2)
+    assert outcome.status == "not_converged"
+    assert outcome.findings["SEC-1"].status == "open"
+    assert "Unverified" in llm.prompts["fixer"][0]
+    text = report.write(outcome, repo / ".reviewloop", Usage()).read_text()
+    assert "(blocker, unverified)" in text
+
+
+def test_human_can_dismiss_an_unverified_blocker_for_later_runs(repo):
+    triage(repo, ReportsLLM(quote="not in the file"), "p")
+    outcome = triage(repo, ReportsLLM(quote="not in the file"))
+    assert outcome.status == "approved"
+    assert outcome.findings["SEC-1"].status == "suppressed"
 
 
 def test_dropped_finding_never_reaches_fixer_or_later_review_prompts(repo):
@@ -528,7 +571,7 @@ def test_dropped_finding_never_reaches_fixer_or_later_review_prompts(repo):
     def invented(system, user, schema, tools=None):
         result = original(system, user, schema, tools)
         for finding in result.get("findings", []):
-            finding["quote"] = "not in the file"
+            finding.update(severity="major", quote="not in the file")
         return result
 
     llm.structured = invented
