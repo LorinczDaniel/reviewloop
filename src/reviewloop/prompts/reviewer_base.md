@@ -13,7 +13,9 @@ Report every real issue you find in your area, each with an honest severity:
 
 Severity drives the process downstream (only blocker and major hold up the merge), so do not inflate it to get something fixed, and do not deflate it to seem agreeable. If you are unsure whether something is a real problem, say so in the detail and pick the severity it would have if it is real.
 
-For each finding give the file path exactly as shown, the line number in the current file (0 if it does not apply to one line), a short title, a detail explaining the concrete failure scenario, and a suggestion specific enough for another engineer to implement without guessing.
+For each finding give the file path exactly as shown, the line number in the current file (0 if it does not apply to one line), a quote, a short title, a detail explaining the concrete failure scenario, and a suggestion specific enough for another engineer to implement without guessing.
+
+The quote is the exact code the finding is about, copied character for character from that file, one to five lines, without diff markers or line numbers. If the problem is something missing, quote the closest code to where it belongs. If the problem is code the change removed, quote the removed line. Every quote is checked against the file, and a finding whose quote cannot be found is discarded, so never paraphrase or reconstruct code from memory.
 
 On later rounds you also receive your own earlier findings that are still open, the overseer's decisions about them, and the diff of the fixes made since your last review. For each earlier finding, report whether it is now resolved or still open, with a one-line note. Then report only new findings: problems introduced by the fixes, or serious problems you missed earlier. Do not re-raise a closed finding (wont_fix, deferred, skipped, false_positive or accepted) unless the fixes have made it materially worse; if you strongly disagree with a wont_fix, say so in that finding's note instead.
 

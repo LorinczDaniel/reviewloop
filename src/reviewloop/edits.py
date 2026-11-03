@@ -12,7 +12,7 @@ class EditResult:
     message: str
 
 
-def _resolve(repo: Path, rel: str) -> Path | None:
+def resolve_in_repo(repo: Path, rel: str) -> Path | None:
     path = (repo / rel).resolve()
     if not path.is_relative_to(repo.resolve()) or ".git" in path.relative_to(repo.resolve()).parts:
         return None
@@ -30,7 +30,7 @@ def apply_edits(repo: Path, edits: list[dict]) -> tuple[list[EditResult], str, d
 
     for edit in edits:
         rel, old, new = edit["file"], edit["old_str"], edit["new_str"]
-        path = _resolve(repo, rel)
+        path = resolve_in_repo(repo, rel)
         if path is None:
             results.append(EditResult(rel, False, "path is outside the repository"))
             continue

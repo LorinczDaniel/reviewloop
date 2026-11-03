@@ -29,6 +29,7 @@ def write(outcome: Outcome, out_dir: Path, usage) -> Path:
                             ("Won't fix (you)", {"accepted"}), ("Skipped (you)", {"skipped"}),
                             ("False positive (you)", {"false_positive"}),
                             ("Suppressed (dismissed in an earlier decision)", {"suppressed"}),
+                            ("Dropped (quote not found)", {"dropped"}),
                             ("Deferred", {"deferred"}), ("Resolved", {"resolved"})]:
         group = [f for f in findings if f.status in statuses]
         if not group:
