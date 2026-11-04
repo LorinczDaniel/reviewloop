@@ -1,6 +1,7 @@
 """Command-line entry point: `reviewloop [options]`."""
 
 import argparse
+import math
 import subprocess
 import sys
 import time
@@ -12,7 +13,7 @@ from .loop import Config, ReviewLoop, load_reviewers
 from .schemas import SEVERITIES
 
 FAST_MODEL = "claude-sonnet-5-5"
-EXIT = {"approved": 0, "nothing_to_review": 0, "report_only": 0, "not_converged": 1, "triage_aborted": 1}
+EXIT = {"approved": 0, "nothing_to_review": 0, "report_only": 0, "not_converged": 1, "triage_aborted": 1, "over_budget": 1}
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -28,6 +29,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help=f"comma-separated severities that block approval (from {','.join(SEVERITIES)})")
     p.add_argument("--check", action="append", default=[], metavar="CMD",
                    help="shell command that must pass, e.g. 'pytest -q' (repeatable)")
+    p.add_argument("--budget", type=float, metavar="USD",
+                   help="stop with a report once the cost reaches this many dollars, e.g. 2.00 "
+                        "(claude-code backend only; calls already running finish, so it can go over)")
     p.add_argument("--no-fix", action="store_true", help="review once and report, without changing any files")
     p.add_argument("--triage", action="store_true",
                    help="mark each finding fix, skip or false positive yourself, instead of running the overseer")
@@ -60,6 +64,14 @@ def main(argv=None) -> int:
         print(f"error: --block must be a subset of {SEVERITIES}", file=sys.stderr)
         return 2
 
+    if args.budget is not None:
+        problem = ("--budget must be a positive number of dollars" if not (math.isfinite(args.budget) and args.budget > 0)
+                   else "--budget needs --backend claude-code, because the api backend doesn't report a cost" if args.backend != "claude-code"
+                   else None)
+        if problem:
+            print(f"error: {problem}", file=sys.stderr)
+            return 2
+
     if args.triage:
         problem = ("--triage can't be combined with --no-fix, because no fixer runs" if args.no_fix
                    else "--triage needs --max-rounds of at least 2, so a later round can verify the fixes" if args.max_rounds < 2
@@ -85,7 +97,8 @@ def main(argv=None) -> int:
             return 2
 
     cfg = Config(repo=repo, base=args.base, max_rounds=args.max_rounds, blocking=blocking,
-                 checks=args.check, fix=not args.no_fix, out_dir=out_dir, explore=args.explore, triage=args.triage)
+                 checks=args.check, fix=not args.no_fix, out_dir=out_dir, explore=args.explore, triage=args.triage,
+                 budget=args.budget)
     model = args.model or (FAST_MODEL if args.fast else DEFAULT_MODEL)
     effort = args.effort or ("medium" if args.fast else "high")
     try:

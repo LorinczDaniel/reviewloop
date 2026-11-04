@@ -1217,3 +1217,98 @@ def test_suppressions_are_only_sent_for_files_shown(two_files):
     run(two_files, llm, max_rounds=2)
     assert "<suppressed_findings>" in llm.prompts["safety", 1]
     assert "<suppressed_findings>" not in llm.prompts["safety", 2]
+
+
+# ---- budget -------------------------------------------------------------------
+
+
+class CostingLLM(SameLineLLM):
+    """Each call costs the same, and is recorded by agent."""
+
+    def __init__(self, *a, cost=1.0, resolve=False, **kw):
+        super().__init__(*a, **kw)
+        self.cost, self.resolve, self.calls = cost, resolve, []
+
+    def structured(self, system, user, schema, tools=None):
+        self.usage.add(1, 1, self.cost)
+        self.calls.append({id(REVIEW_SCHEMA): "review", id(OVERSEER_SCHEMA): "overseer", id(FIXER_SCHEMA): "fixer"}[id(schema)])
+        result = super().structured(system, user, schema, tools)
+        if self.resolve and schema is REVIEW_SCHEMA and "[SEC-1]" in user.split("<your_open_findings>")[-1]:
+            return {**result, "previous": [{"id": "SEC-1", "status": "resolved", "note": ""}]}
+        return result
+
+
+BLOCKER = {("security", 1): [item("blocker", title="bad")]}
+EDIT_SIGNATURE = {"file": "app.py", "old_str": SIGNATURE, "new_str": f"# note\n{SIGNATURE}", "finding_ids": []}
+
+
+def test_budget_hit_by_the_first_review_stops_before_the_overseer(repo):
+    llm = CostingLLM(BLOCKER, [decision("SEC-1")])
+    outcome = run(repo, llm, budget=2.0)
+    assert outcome.status == "over_budget"
+    assert llm.calls == ["review"] * 3  # calls already running finish
+    assert outcome.findings["SEC-1"].status == "open"
+    assert (repo / "app.py").read_text() == BUGGY
+
+
+def test_budget_hit_by_the_overseer_stops_before_the_fixer(repo):
+    llm = CostingLLM(BLOCKER, [decision("SEC-1")])
+    outcome = run(repo, llm, budget=3.5)
+    assert outcome.status == "over_budget"
+    assert llm.calls == ["review"] * 3 + ["overseer"]
+
+
+def test_budget_hit_by_the_fixer_stops_before_the_next_review(repo):
+    llm = CostingLLM(BLOCKER, [decision("SEC-1")], [EDIT_SIGNATURE])
+    outcome = run(repo, llm, budget=4.5)
+    assert outcome.status == "over_budget"
+    assert llm.calls == ["review"] * 3 + ["overseer", "fixer"]
+    assert len(outcome.rounds) == 1
+    assert (repo / ".reviewloop/backup/app.py").read_text() == BUGGY  # the unreviewed fix can be undone
+
+
+def test_approved_review_stays_approved_when_it_reaches_the_budget(repo):
+    outcome = run(repo, CostingLLM({}), budget=1.0)
+    assert outcome.status == "approved"
+
+
+def test_report_only_run_stays_report_only_when_it_reaches_the_budget(repo):
+    outcome = run(repo, CostingLLM(BLOCKER), budget=1.0, fix=False)
+    assert outcome.status == "report_only"
+
+
+def test_no_budget_means_no_limit(repo):
+    llm = CostingLLM(BLOCKER, [decision("SEC-1")], [EDIT_SIGNATURE], cost=1000.0, resolve=True)
+    assert run(repo, llm).status == "approved"
+
+
+def test_budget_exactly_reached_counts_as_reached(repo):
+    assert run(repo, CostingLLM(BLOCKER), budget=3.0).status == "over_budget"
+
+
+def test_under_budget_runs_to_the_end(repo):
+    llm = CostingLLM(BLOCKER, [decision("SEC-1")], [EDIT_SIGNATURE], resolve=True)
+    assert run(repo, llm, budget=100.0).status == "approved"
+
+
+def test_over_budget_report_and_exit_code(repo, monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(cli, "ClaudeCodeLLM", lambda **_: CostingLLM(BLOCKER))
+    out = tmp_path / "out"
+    assert cli.main(["--repo", str(repo), "-y", "--budget", "1", "--out", str(out)]) == 1
+    assert "Over budget" in (out / "report.md").read_text()
+    assert "SEC-1" in (out / "report.md").read_text()
+    assert json.loads((out / "report.json").read_text())["status"] == "over_budget"
+    assert "Budget reached: $3.0000 spent of $1.0000" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf"])
+def test_bad_budget_is_a_usage_error(repo, monkeypatch, value, capsys):
+    monkeypatch.setattr(cli, "ClaudeCodeLLM", lambda **_: pytest.fail("no model call expected"))
+    assert cli.main(["--repo", str(repo), "-y", f"--budget={value}"]) == 2
+    assert "positive number" in capsys.readouterr().err
+
+
+def test_budget_with_the_api_backend_is_a_usage_error(repo, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "ApiLLM", lambda **_: pytest.fail("no model call expected"))
+    assert cli.main(["--repo", str(repo), "-y", "--budget", "1", "--backend", "api"]) == 2
+    assert "doesn't report a cost" in capsys.readouterr().err

@@ -12,6 +12,7 @@ HEADLINES = {
     "not_converged": "⚠️ Not converged — blocking findings remain after the round limit. Needs a human.",
     "report_only": "📝 Report only — findings were not fixed (--no-fix).",
     "nothing_to_review": "Nothing to review — no changes against the base.",
+    "over_budget": "💸 Over budget — stopped at the --budget limit with work unfinished. Any fixes from the last round have not been re-reviewed.",
     "triage_aborted": "🛑 Triage aborted — the fixer did not run this round. Decisions made so far are in this report.",
 }
 

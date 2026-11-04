@@ -68,6 +68,7 @@ By default each agent is a headless `claude -p` call on your Claude Code login, 
 | Option | Default | What it does |
 |---|---|---|
 | `--base REF` | `HEAD` | Review changes against this git ref, e.g. `main` |
+| `--budget USD` | none | Stop with a report once the cost reaches this, e.g. `2.00`. Can go over; see below. `claude-code` backend only |
 | `--no-fix` | off | One review pass and a report; no files are changed |
 | `--triage` | off | Mark each finding fix, skip or false positive yourself; the overseer doesn't run. Needs an interactive terminal |
 | `--check CMD` | none | Command that must pass before approval, e.g. `"pytest -q"`. Repeatable |
@@ -83,7 +84,7 @@ By default each agent is a headless `claude -p` call on your Claude Code login, 
 | `--out DIR` | `<repo>/.reviewloop` | Where reports and backups go |
 | `-y`, `--yes` | off | Don't ask before the fixer edits files |
 
-Exit codes: `0` approved, nothing to review, or report-only; `1` not converged (blocking findings remain) or triage aborted; `2` usage error. This lets you use it in scripts or CI, e.g. `reviewloop -y --check "pytest -q" && git commit`.
+Exit codes: `0` approved, nothing to review, or report-only; `1` not converged (blocking findings remain), triage aborted, or over budget; `2` usage error. This lets you use it in scripts or CI, e.g. `reviewloop -y --check "pytest -q" && git commit`.
 
 ## How it converges
 
@@ -94,6 +95,14 @@ Exit codes: `0` approved, nothing to review, or report-only; `1` not converged (
 - **Findings on the same line are merged.** When different reviewers flag one line, the overseer sees them as a group and normally makes one decision, and the fixer gets them together. The overseer can still decide on each one separately if they're different problems. Each finding keeps its own id, status and place in the report, and each reviewer still checks its own finding in later rounds. Unverified findings are never merged, and `--triage` still asks you about each finding, though the fixer gets the ones you mark as fix grouped the same way.
 - **The overseer settles conflicts.** Priority is safety > security > readability. Findings it closes as `wont_fix` (each with a reason) are not raised again. It cannot defer a blocking finding or close a blocker as `wont_fix`. A blocker the fixer can't resolve stops the run at the round limit, and you can close it yourself with `--triage`.
 - **Hard limits.** `--max-rounds` (default 4), and any failing `--check` blocks approval.
+
+## Budget
+
+`--budget 2.00` checks the cost between steps and stops with a normal report once it reaches the limit. The exit code is `1`, unless that review pass was already approved or `--no-fix` was set.
+
+- **It can go over.** Calls that are running finish, and each step can be several parallel reviewers, so a run can overshoot by up to one step. Set it lower than your real limit.
+- **Fixes may be unreviewed.** If it stops right after the fixer ran, those edits stay in your files without a re-review. The report says so. Originals are in `.reviewloop/backup/`, and `git diff` shows the changes.
+- **The cost is Claude Code's figure.** On a Claude plan, that's an estimate rather than what you're billed. `--backend api` doesn't report a cost, so combining it with `--budget` is a usage error rather than a cap that never triggers.
 
 ## Triage
 
