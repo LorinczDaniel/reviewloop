@@ -1181,3 +1181,236 @@ def test_default_split_skips_a_reviewer_that_is_not_running(repo, named):
 def test_bad_reviewer_model_is_a_usage_error(repo, named, spec):
     assert cli.main(["--repo", str(repo), "-y", "--reviewer-model", spec]) == 2
     assert named.made == []
+
+
+# ---- skipping unchanged files -------------------------------------------------
+
+OTHER = "def other():\n    return 1\n"
+
+
+class RoundsLLM(SameLineLLM):
+    """Records each reviewer's prompt per round, and can fail chosen calls."""
+
+    def __init__(self, *a, fail=(), **kw):
+        super().__init__(*a, **kw)
+        self.fail, self.prompts = set(fail), {}
+
+    def structured(self, system, user, schema, tools=None):
+        if schema is REVIEW_SCHEMA:
+            n = int(user.split("This is review round ")[1].split(".")[0])
+            area = next(a for a, words in AREAS.items() if f"Your area is {words}" in system)
+            self.prompts[area, n] = user
+            if (area, n) in self.fail:
+                raise llm_module.LLMError("boom")
+        return super().structured(system, user, schema, tools)
+
+
+@pytest.fixture
+def two_files(repo):
+    (repo / "other.py").write_text(OTHER)
+    return repo
+
+
+EDIT_APP = {"file": "app.py", "old_str": SIGNATURE, "new_str": f"# note\n{SIGNATURE}", "finding_ids": []}
+ONE_MAJOR = {("security", 1): [item(title="a")]}
+
+
+def test_round_two_only_shows_files_changed_since_the_last_review(two_files):
+    llm = RoundsLLM(ONE_MAJOR, [decision("SEC-1")], [EDIT_APP])
+    run(two_files, llm, max_rounds=2)
+
+    first, second = llm.prompts["safety", 1], llm.prompts["safety", 2]
+    assert '<file path="other.py">' in first
+    assert '<file path="other.py">' not in second
+    assert '<file path="app.py">' in second and "# note" in second
+    assert "other.py" not in block(second, "diff")
+    assert "not shown again: other.py" in second
+    assert "<fixes_since_last_review>" in second
+
+
+def test_open_finding_keeps_its_unchanged_file_in_view(two_files):
+    finding = {("security", 1): [{**item(quote="def other"), "file": "other.py", "line": 1}]}
+    llm = RoundsLLM(finding, [decision("SEC-1")], [EDIT_APP])
+    run(two_files, llm, max_rounds=2)
+    assert '<file path="other.py">' in llm.prompts["security", 2]
+    assert '<file path="other.py">' not in llm.prompts["safety", 2]
+
+
+def test_reviewer_with_nothing_new_is_not_called(two_files):
+    outcome = run(two_files, llm := RoundsLLM(ONE_MAJOR, [decision("SEC-1")]), max_rounds=2)  # no edits applied
+    assert ("safety", 2) not in llm.prompts
+    assert ("security", 2) in llm.prompts  # it still has an open finding
+    assert "wasn't asked again" in outcome.rounds[1].summaries["safety"]
+    assert outcome.rounds[1].errors == {}
+
+
+def test_skipped_reviewers_do_not_block_approval(two_files):
+    class Resolves(RoundsLLM):
+        def structured(self, system, user, schema, tools=None):
+            result = super().structured(system, user, schema, tools)
+            if schema is REVIEW_SCHEMA and "<your_open_findings>" in user and "[SEC-1]" in user:
+                return {**result, "previous": [{"id": "SEC-1", "status": "resolved", "note": ""}]}
+            return result
+
+    outcome = run(two_files, Resolves(ONE_MAJOR, [decision("SEC-1")]), max_rounds=2)
+    assert outcome.status == "approved"
+
+
+def test_reviewer_whose_first_call_failed_gets_everything_next_round(two_files):
+    llm = RoundsLLM(ONE_MAJOR, [decision("SEC-1")], fail={("safety", 1)})
+    outcome = run(two_files, llm, max_rounds=2)
+    second = llm.prompts["safety", 2]
+    assert '<file path="other.py">' in second and '<file path="app.py">' in second
+    assert "Review the change in your area." in second
+    assert "not shown again" not in second
+    assert "safety" in outcome.rounds[0].errors
+
+
+def test_reviewer_whose_call_failed_later_still_gets_the_fix_it_missed(two_files):
+    finding = {("security", 1): [item(title="a")]}
+    llm = RoundsLLM(finding, [decision("SEC-1")], [EDIT_APP], fail={("safety", 2)})
+    run(two_files, llm, max_rounds=3)
+    assert '<file path="app.py">' in llm.prompts["safety", 2]
+    assert '<file path="app.py">' in llm.prompts["safety", 3]  # no edit in round 2, but it never saw round 1's
+
+
+def test_a_file_changed_by_a_check_is_sent_again(two_files):
+    llm = RoundsLLM(ONE_MAJOR, [decision("SEC-1")])
+    run(two_files, llm, max_rounds=2, checks=["echo '# formatted' >> other.py"])
+    assert ("safety", 2) in llm.prompts
+    assert "# formatted" in llm.prompts["safety", 2]
+
+
+def test_new_finding_can_quote_a_file_not_shown_again(two_files):
+    findings = {("security", 1): [item(title="a")],
+                ("safety", 2): [{**item(quote="def other", title="b"), "file": "other.py", "line": 1}]}
+    llm = RoundsLLM(findings, [decision("SEC-1")], [EDIT_APP])
+    outcome = run(two_files, llm, max_rounds=2)
+    assert outcome.findings["SAF-1"].verified is True
+    assert outcome.findings["SAF-1"].status == "open"
+
+
+def test_overseer_and_fixer_still_get_every_file(two_files):
+    llm = RoundsLLM(ONE_MAJOR, [decision("SEC-1")], [EDIT_APP])
+    run(two_files, llm, max_rounds=3)
+    assert all('<file path="other.py">' in p for p in llm.overseer_prompts + llm.fixer_prompts)
+    assert len(llm.overseer_prompts) == 2
+
+
+def test_suppressions_are_only_sent_for_files_shown(two_files):
+    (two_files / ".reviewloop").mkdir()
+    code = OTHER.splitlines()[0]
+    suppressions_file(two_files).write_text(json.dumps({"version": 1, "suppressions": [{
+        "reviewer": "safety", "severity": "minor", "file": "other.py", "title": "t", "detail": "d", "code": code,
+        "decided_by": "human", "reason": "r", "decided_at": "2026-11-02"}]}))
+    llm = RoundsLLM(ONE_MAJOR, [decision("SEC-1")], [EDIT_APP])
+    run(two_files, llm, max_rounds=2)
+    assert "<suppressed_findings>" in llm.prompts["safety", 1]
+    assert "<suppressed_findings>" not in llm.prompts["safety", 2]
+
+
+# ---- budget -------------------------------------------------------------------
+
+
+class CostingLLM(SameLineLLM):
+    """Each call costs the same, and is recorded by agent."""
+
+    def __init__(self, *a, cost=1.0, resolve=False, **kw):
+        super().__init__(*a, **kw)
+        self.cost, self.resolve, self.calls = cost, resolve, []
+
+    def structured(self, system, user, schema, tools=None):
+        self.usage.add(1, 1, self.cost)
+        self.calls.append({id(REVIEW_SCHEMA): "review", id(OVERSEER_SCHEMA): "overseer", id(FIXER_SCHEMA): "fixer"}[id(schema)])
+        result = super().structured(system, user, schema, tools)
+        if self.resolve and schema is REVIEW_SCHEMA and "[SEC-1]" in user.split("<your_open_findings>")[-1]:
+            return {**result, "previous": [{"id": "SEC-1", "status": "resolved", "note": ""}]}
+        return result
+
+
+BLOCKER = {("security", 1): [item("blocker", title="bad")]}
+EDIT_SIGNATURE = {"file": "app.py", "old_str": SIGNATURE, "new_str": f"# note\n{SIGNATURE}", "finding_ids": []}
+
+
+def test_budget_hit_by_the_first_review_stops_before_the_overseer(repo):
+    llm = CostingLLM(BLOCKER, [decision("SEC-1")])
+    outcome = run(repo, llm, budget=2.0)
+    assert outcome.status == "over_budget"
+    assert llm.calls == ["review"] * 3  # calls already running finish
+    assert outcome.findings["SEC-1"].status == "open"
+    assert (repo / "app.py").read_text() == BUGGY
+
+
+def test_budget_hit_by_the_overseer_stops_before_the_fixer(repo):
+    llm = CostingLLM(BLOCKER, [decision("SEC-1")])
+    outcome = run(repo, llm, budget=3.5)
+    assert outcome.status == "over_budget"
+    assert llm.calls == ["review"] * 3 + ["overseer"]
+
+
+def test_budget_hit_by_the_fixer_stops_before_the_next_review(repo):
+    llm = CostingLLM(BLOCKER, [decision("SEC-1")], [EDIT_SIGNATURE])
+    outcome = run(repo, llm, budget=4.5)
+    assert outcome.status == "over_budget"
+    assert llm.calls == ["review"] * 3 + ["overseer", "fixer"]
+    assert len(outcome.rounds) == 1
+    assert (repo / ".reviewloop/backup/app.py").read_text() == BUGGY  # the unreviewed fix can be undone
+
+
+def test_approved_review_stays_approved_when_it_reaches_the_budget(repo):
+    outcome = run(repo, CostingLLM({}), budget=1.0)
+    assert outcome.status == "approved"
+
+
+def test_report_only_run_stays_report_only_when_it_reaches_the_budget(repo):
+    outcome = run(repo, CostingLLM(BLOCKER), budget=1.0, fix=False)
+    assert outcome.status == "report_only"
+
+
+def test_no_budget_means_no_limit(repo):
+    llm = CostingLLM(BLOCKER, [decision("SEC-1")], [EDIT_SIGNATURE], cost=1000.0, resolve=True)
+    assert run(repo, llm).status == "approved"
+
+
+def test_budget_exactly_reached_counts_as_reached(repo):
+    assert run(repo, CostingLLM(BLOCKER), budget=3.0).status == "over_budget"
+
+
+def test_under_budget_runs_to_the_end(repo):
+    llm = CostingLLM(BLOCKER, [decision("SEC-1")], [EDIT_SIGNATURE], resolve=True)
+    assert run(repo, llm, budget=100.0).status == "approved"
+
+
+def test_over_budget_report_and_exit_code(repo, monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(cli, "ClaudeCodeLLM", lambda **_: CostingLLM(BLOCKER))
+    out = tmp_path / "out"
+    assert cli.main(["--repo", str(repo), "-y", "--fast", "--budget", "1", "--out", str(out)]) == 1
+    assert "Over budget" in (out / "report.md").read_text()
+    assert "SEC-1" in (out / "report.md").read_text()
+    assert json.loads((out / "report.json").read_text())["status"] == "over_budget"
+    assert "Budget reached: $3.0000 spent of $1.0000" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf"])
+def test_bad_budget_is_a_usage_error(repo, monkeypatch, value, capsys):
+    monkeypatch.setattr(cli, "ClaudeCodeLLM", lambda **_: pytest.fail("no model call expected"))
+    assert cli.main(["--repo", str(repo), "-y", f"--budget={value}"]) == 2
+    assert "positive number" in capsys.readouterr().err
+
+
+def test_budget_with_the_api_backend_is_a_usage_error(repo, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "ApiLLM", lambda **_: pytest.fail("no model call expected"))
+    assert cli.main(["--repo", str(repo), "-y", "--budget", "1", "--backend", "api"]) == 2
+    assert "doesn't report a cost" in capsys.readouterr().err
+
+
+def test_budget_counts_reviewers_on_other_models(repo, named, monkeypatch, capsys):
+    original = NamedLLM.structured
+
+    def costly(self, system, user, schema, tools=None):
+        self.usage.add(0, 0, 1.0)
+        return original(self, system, user, schema, tools)
+
+    monkeypatch.setattr(NamedLLM, "structured", costly)
+    cli.main(["--repo", str(repo), "-y", "--budget", "3"])  # one of the three reviewers is on Sonnet
+    assert "Budget reached: $3.0000" in capsys.readouterr().out
