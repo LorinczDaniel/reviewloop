@@ -1091,3 +1091,129 @@ def test_triage_asks_about_each_finding_but_the_fixer_gets_them_together(repo):
     assert not llm.overseer_prompts
     assert next(answers, "used up") == "used up"
     assert "Same line, fix together: app.py:2" in llm.fixer_prompts[0]
+
+
+# ---- skipping unchanged files -------------------------------------------------
+
+OTHER = "def other():\n    return 1\n"
+
+
+class RoundsLLM(SameLineLLM):
+    """Records each reviewer's prompt per round, and can fail chosen calls."""
+
+    def __init__(self, *a, fail=(), **kw):
+        super().__init__(*a, **kw)
+        self.fail, self.prompts = set(fail), {}
+
+    def structured(self, system, user, schema, tools=None):
+        if schema is REVIEW_SCHEMA:
+            n = int(user.split("This is review round ")[1].split(".")[0])
+            area = next(a for a, words in AREAS.items() if f"Your area is {words}" in system)
+            self.prompts[area, n] = user
+            if (area, n) in self.fail:
+                raise llm_module.LLMError("boom")
+        return super().structured(system, user, schema, tools)
+
+
+@pytest.fixture
+def two_files(repo):
+    (repo / "other.py").write_text(OTHER)
+    return repo
+
+
+EDIT_APP = {"file": "app.py", "old_str": SIGNATURE, "new_str": f"# note\n{SIGNATURE}", "finding_ids": []}
+ONE_MAJOR = {("security", 1): [item(title="a")]}
+
+
+def test_round_two_only_shows_files_changed_since_the_last_review(two_files):
+    llm = RoundsLLM(ONE_MAJOR, [decision("SEC-1")], [EDIT_APP])
+    run(two_files, llm, max_rounds=2)
+
+    first, second = llm.prompts["safety", 1], llm.prompts["safety", 2]
+    assert '<file path="other.py">' in first
+    assert '<file path="other.py">' not in second
+    assert '<file path="app.py">' in second and "# note" in second
+    assert "other.py" not in block(second, "diff")
+    assert "not shown again: other.py" in second
+    assert "<fixes_since_last_review>" in second
+
+
+def test_open_finding_keeps_its_unchanged_file_in_view(two_files):
+    finding = {("security", 1): [{**item(quote="def other"), "file": "other.py", "line": 1}]}
+    llm = RoundsLLM(finding, [decision("SEC-1")], [EDIT_APP])
+    run(two_files, llm, max_rounds=2)
+    assert '<file path="other.py">' in llm.prompts["security", 2]
+    assert '<file path="other.py">' not in llm.prompts["safety", 2]
+
+
+def test_reviewer_with_nothing_new_is_not_called(two_files):
+    outcome = run(two_files, llm := RoundsLLM(ONE_MAJOR, [decision("SEC-1")]), max_rounds=2)  # no edits applied
+    assert ("safety", 2) not in llm.prompts
+    assert ("security", 2) in llm.prompts  # it still has an open finding
+    assert "wasn't asked again" in outcome.rounds[1].summaries["safety"]
+    assert outcome.rounds[1].errors == {}
+
+
+def test_skipped_reviewers_do_not_block_approval(two_files):
+    class Resolves(RoundsLLM):
+        def structured(self, system, user, schema, tools=None):
+            result = super().structured(system, user, schema, tools)
+            if schema is REVIEW_SCHEMA and "<your_open_findings>" in user and "[SEC-1]" in user:
+                return {**result, "previous": [{"id": "SEC-1", "status": "resolved", "note": ""}]}
+            return result
+
+    outcome = run(two_files, Resolves(ONE_MAJOR, [decision("SEC-1")]), max_rounds=2)
+    assert outcome.status == "approved"
+
+
+def test_reviewer_whose_first_call_failed_gets_everything_next_round(two_files):
+    llm = RoundsLLM(ONE_MAJOR, [decision("SEC-1")], fail={("safety", 1)})
+    outcome = run(two_files, llm, max_rounds=2)
+    second = llm.prompts["safety", 2]
+    assert '<file path="other.py">' in second and '<file path="app.py">' in second
+    assert "Review the change in your area." in second
+    assert "not shown again" not in second
+    assert "safety" in outcome.rounds[0].errors
+
+
+def test_reviewer_whose_call_failed_later_still_gets_the_fix_it_missed(two_files):
+    finding = {("security", 1): [item(title="a")]}
+    llm = RoundsLLM(finding, [decision("SEC-1")], [EDIT_APP], fail={("safety", 2)})
+    run(two_files, llm, max_rounds=3)
+    assert '<file path="app.py">' in llm.prompts["safety", 2]
+    assert '<file path="app.py">' in llm.prompts["safety", 3]  # no edit in round 2, but it never saw round 1's
+
+
+def test_a_file_changed_by_a_check_is_sent_again(two_files):
+    llm = RoundsLLM(ONE_MAJOR, [decision("SEC-1")])
+    run(two_files, llm, max_rounds=2, checks=["echo '# formatted' >> other.py"])
+    assert ("safety", 2) in llm.prompts
+    assert "# formatted" in llm.prompts["safety", 2]
+
+
+def test_new_finding_can_quote_a_file_not_shown_again(two_files):
+    findings = {("security", 1): [item(title="a")],
+                ("safety", 2): [{**item(quote="def other", title="b"), "file": "other.py", "line": 1}]}
+    llm = RoundsLLM(findings, [decision("SEC-1")], [EDIT_APP])
+    outcome = run(two_files, llm, max_rounds=2)
+    assert outcome.findings["SAF-1"].verified is True
+    assert outcome.findings["SAF-1"].status == "open"
+
+
+def test_overseer_and_fixer_still_get_every_file(two_files):
+    llm = RoundsLLM(ONE_MAJOR, [decision("SEC-1")], [EDIT_APP])
+    run(two_files, llm, max_rounds=3)
+    assert all('<file path="other.py">' in p for p in llm.overseer_prompts + llm.fixer_prompts)
+    assert len(llm.overseer_prompts) == 2
+
+
+def test_suppressions_are_only_sent_for_files_shown(two_files):
+    (two_files / ".reviewloop").mkdir()
+    code = OTHER.splitlines()[0]
+    suppressions_file(two_files).write_text(json.dumps({"version": 1, "suppressions": [{
+        "reviewer": "safety", "severity": "minor", "file": "other.py", "title": "t", "detail": "d", "code": code,
+        "decided_by": "human", "reason": "r", "decided_at": "2026-11-02"}]}))
+    llm = RoundsLLM(ONE_MAJOR, [decision("SEC-1")], [EDIT_APP])
+    run(two_files, llm, max_rounds=2)
+    assert "<suppressed_findings>" in llm.prompts["safety", 1]
+    assert "<suppressed_findings>" not in llm.prompts["safety", 2]

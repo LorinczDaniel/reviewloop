@@ -2,7 +2,7 @@
 
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from importlib.resources import files as package_files
 from pathlib import Path
@@ -110,6 +110,7 @@ class ReviewLoop:
                  ask: Callable[[str], str] = input):
         self.cfg, self.llm, self.reviewers, self.log, self.ask = cfg, llm, reviewers, log, ask
         self.findings: dict[str, Finding] = {}
+        self.seen: dict[str, dict[str, str]] = {}  # reviewer name -> files as of its last successful review
         self.marked_fix: set[str] = set()  # finding ids the user sent to the fixer in triage
         self.counters = {r.prefix: 0 for r in reviewers}
         self.backup_dir = cfg.out_dir / "backup" if cfg.out_dir else None
@@ -190,14 +191,22 @@ class ReviewLoop:
     # ---- reviewers -------------------------------------------------------
 
     def _review(self, n: int, ctx: context.ReviewContext, fix_diff: str, rl: RoundLog) -> None:
-        rendered = ctx.render()
         start = time.monotonic()
-        self.log(f"  reviewing in parallel: {', '.join(r.name for r in self.reviewers)}")
-        with ThreadPoolExecutor(max_workers=len(self.reviewers)) as pool:
+        prompts = {}
+        for r in self.reviewers:
+            mine = self._context_for(r, ctx)
+            if r.name in self.seen and not mine.files and not self._open_findings(r):
+                rl.summaries[r.name] = "Nothing changed since its last review, so it wasn't asked again."
+                self.log(f"  {r.name}: skipped; nothing changed since its last review and no open findings")
+                continue
+            prompts[r] = self._review_prompt(r, n, mine, fix_diff, set(ctx.files) - set(mine.files))
+        if not prompts:
+            return
+        self.log(f"  reviewing in parallel: {', '.join(r.name for r in prompts)}")
+        with ThreadPoolExecutor(max_workers=len(prompts)) as pool:
             pending = {
-                pool.submit(self.llm.structured, r.system, self._review_prompt(r, n, rendered, fix_diff, ctx.files),
-                            REVIEW_SCHEMA, EXPLORE_TOOLS if self.cfg.explore else None): r
-                for r in self.reviewers
+                pool.submit(self.llm.structured, r.system, prompt, REVIEW_SCHEMA, EXPLORE_TOOLS if self.cfg.explore else None): r
+                for r, prompt in prompts.items()
             }
             while pending:
                 done, _ = wait(pending, timeout=HEARTBEAT_SECONDS, return_when=FIRST_COMPLETED)
@@ -212,20 +221,40 @@ class ReviewLoop:
                         rl.errors[r.name] = str(e)
                         self.log(f"  {r.name}: ERROR {e} ({_elapsed(start)})")
                         continue
+                    self.seen[r.name] = ctx.files
                     self._record_review(r, n, result, rl, _elapsed(start), ctx.files)
 
-    def _review_prompt(self, r: Reviewer, n: int, rendered: str, fix_diff: str, files: dict[str, str]) -> str:
+    def _open_findings(self, r: Reviewer) -> list[Finding]:
+        return [f for f in self.findings.values() if f.reviewer == r.name and f.status == "open"]
+
+    def _context_for(self, r: Reviewer, ctx: context.ReviewContext) -> context.ReviewContext:
+        """What this reviewer needs: files changed since it last succeeded, and those with its open findings.
+
+        Compares contents rather than tracking the fixer's edits, so a failed call or a
+        formatter run as a check can't hide a change.
+        """
+        seen = self.seen.get(r.name)
+        if seen is None:
+            return ctx
+        keep = {path for path, text in ctx.files.items() if seen.get(path) != text}
+        keep |= {f.file for f in self._open_findings(r) if f.file in ctx.files}
+        return replace(ctx, files={path: text for path, text in ctx.files.items() if path in keep},
+                       diff=context.full_diff(self.cfg.repo, self.cfg.base, sorted(keep)))
+
+    def _review_prompt(self, r: Reviewer, n: int, ctx: context.ReviewContext, fix_diff: str, unchanged: set[str]) -> str:
         mine = [f for f in self.findings.values() if f.reviewer == r.name]
         open_ = [f for f in mine if f.status == "open"]
         closed = [f for f in mine if f.status in CLOSED_STATUSES]
-        parts = [rendered, f"\nThis is review round {n}."]
+        parts = [ctx.render(), f"\nThis is review round {n}."]
+        if unchanged:
+            parts.append("Unchanged since your last review, so not shown again: " + ", ".join(sorted(unchanged)))
         dismissed = [s for s in self.suppressions
-                     if s.reviewer == r.name and s.file in files and s.covers(s.severity, self.cfg.blocking)]
+                     if s.reviewer == r.name and s.file in ctx.files and s.covers(s.severity, self.cfg.blocking)]
         if dismissed:
             parts.append("<suppressed_findings>")
             parts += [s.prompt_line() + "\n" for s in dismissed]
             parts.append("</suppressed_findings>")
-        if n == 1:
+        if r.name not in self.seen:  # its first successful review, even if an earlier round's call failed
             parts.append("Review the change in your area.")
             return "\n".join(parts)
         parts.append("<your_open_findings>")
