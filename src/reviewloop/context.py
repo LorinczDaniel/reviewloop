@@ -10,6 +10,8 @@ from .edits import resolve_in_repo
 MAX_FILE_BYTES = 200_000
 MAX_CHECK_OUTPUT = 8_000
 MAX_RULES_BYTES = 20_000
+UNSCOPABLE_COMMAND = re.compile(r"[*()&|;<>$`\n]")  # wildcards, and syntax that makes one line several commands
+MAX_DENY_RULES = 1000
 MAX_RELATED_TEST_BYTES = 100_000
 TEST_PATH = re.compile(r"(^|/)(tests?|specs?|__tests__)/|(^|/)test_[^/]+$|_test\.[^/]+$|\.(test|spec)\.[^/]+$")
 GENERIC_STEMS = {"__init__", "__main__", "index", "main", "mod"}  # these names say nothing about what a test covers
@@ -31,6 +33,26 @@ def changed_files(repo: Path, base: str) -> list[str]:
     tracked = git(repo, "diff", "--name-only", base).splitlines()
     untracked = git(repo, "ls-files", "--others", "--exclude-standard").splitlines()
     return sorted({f for f in tracked + untracked if (repo / f).is_file()})
+
+
+def scopable_checks(commands: list[str]) -> list[str]:
+    """Commands that can be allowed exactly in a Claude Code Bash permission rule."""
+    return [c for c in commands if not UNSCOPABLE_COMMAND.search(c)]
+
+
+def ignored_paths(repo: Path) -> list[str]:
+    """Gitignored files, and directories that are wholly ignored (with a trailing slash)."""
+    return git(repo, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory").splitlines()
+
+
+def snapshot(repo: Path, base: str) -> dict[str, bytes]:
+    """Current contents of every file that differs from the base."""
+    return {rel: (repo / rel).read_bytes() for rel in changed_files(repo, base)}
+
+
+def base_version(repo: Path, base: str, rel: str) -> bytes | None:
+    result = subprocess.run(["git", "show", f"{base}:{rel}"], cwd=repo, capture_output=True)
+    return result.stdout if result.returncode == 0 else None
 
 
 def full_diff(repo: Path, base: str, files: list[str]) -> str:

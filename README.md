@@ -69,6 +69,7 @@ By default each agent is a headless `claude -p` call on your Claude Code login, 
 | Option | Default | What it does |
 |---|---|---|
 | `--base REF` | `HEAD` | Review changes against this git ref, e.g. `main` |
+| `--agentic-fix` | off | When checks fail, an agent runs them and edits files until they pass. Needs `--check` and the `claude-code` backend; see below |
 | `--budget USD` | none | Stop with a report once the cost reaches this, e.g. `2.00`. Can go over; see below. `claude-code` backend only |
 | `--no-fix` | off | One review pass and a report; no files are changed |
 | `--triage` | off | Mark each finding fix, skip or false positive yourself; the overseer doesn't run. Needs an interactive terminal |
@@ -97,6 +98,24 @@ Exit codes: `0` approved, nothing to review, or report-only; `1` not converged (
 - **Findings on the same line are merged.** When different reviewers flag one line, the overseer sees them as a group and normally makes one decision, and the fixer gets them together. The overseer can still decide on each one separately if they're different problems. Each finding keeps its own id, status and place in the report, and each reviewer still checks its own finding in later rounds. Unverified findings are never merged, and `--triage` still asks you about each finding, though the fixer gets the ones you mark as fix grouped the same way.
 - **The overseer settles conflicts.** Priority is safety > security > readability. Findings it closes as `wont_fix` (each with a reason) are not raised again. It cannot defer a blocking finding or close a blocker as `wont_fix`. A blocker the fixer can't resolve stops the run at the round limit, and you can close it yourself with `--triage`.
 - **Hard limits.** `--max-rounds` (default 4), and any failing `--check` blocks approval.
+
+## Agentic fixer
+
+Normally a failing check costs a round: the fixer writes edits without running anything, and you only learn whether they worked when the checks run afterwards. With `--agentic-fix`, an agent runs your checks, edits files and reruns them in one call. If findings were also fixed that round, it runs after those edits. reviewloop reruns the checks itself afterwards rather than trusting the agent, and reviewers review its changes in the next round.
+
+This agent has more power than the regular fixer, so it's off by default and limited with Claude Code's permission rules:
+
+- **Commands:** it can only run your exact `--check` commands, with no other arguments. A command containing `*`, `(`, `)`, `&`, `|`, `;`, `<`, `>`, `$` or a backtick can't be limited safely, so the agent can't run it. The loop still does, and you get a warning. To include such a command, put it in a script and pass that.
+- **Files:** it can read and edit inside the repo only. It can't read or edit gitignored files or `.env*`, and it can't edit `.git` or `.reviewloop`. If there are over 1,000 gitignored paths, it doesn't run.
+
+**What these limits don't cover:**
+
+- Your `--check` commands run with your full permissions, as they always do. The agent can edit the code they run, so it could get anything into a command that way. Use this on code you'd run yourself, not on untrusted branches.
+- Allow rules in your own `~/.claude` settings still apply to this agent, so a broad rule there gives it more than listed here.
+- Each `--check` command has a 30-minute limit inside the agent.
+- With `--budget`, the agent doesn't start once the limit is reached, but a single agent call can use a lot of tokens, so it can overshoot further than a normal step.
+
+Its edits are backed up like any other fix, except that changes to gitignored files wouldn't be detected, which is one reason it's kept away from them.
 
 ## Budget
 

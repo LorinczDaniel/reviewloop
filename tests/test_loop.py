@@ -1503,3 +1503,216 @@ def test_budget_counts_reviewers_on_other_models(repo, named, monkeypatch, capsy
     monkeypatch.setattr(NamedLLM, "structured", costly)
     cli.main(["--repo", str(repo), "-y", "--budget", "4"])  # one of the four reviewers is on Sonnet
     assert "Budget reached: $4.0000" in capsys.readouterr().out
+
+
+# ---- agentic check fixer ------------------------------------------------------
+
+
+class AgentLLM(SameLineLLM):
+    """`work` plays the agent's part by changing files; records what the agent was given."""
+
+    def __init__(self, findings=None, *a, work=lambda: None, **kw):
+        super().__init__(findings or {}, *a, **kw)
+        self.work, self.agent_calls = work, []
+
+    def agent(self, system, user, schema, allowed, denied):
+        self.agent_calls.append({"system": system, "user": user, "allowed": allowed, "denied": denied})
+        self.work()
+        return {"notes": "fixed the test"}
+
+
+def flag_check(repo):
+    """A check that passes once the file named `ok` exists."""
+    return f"test -f {repo}/ok"
+
+
+def test_failing_check_goes_to_the_agent_not_the_structured_fixer(repo):
+    llm = AgentLLM(work=lambda: (repo / "ok").write_text("yes\n"))
+    outcome = run(repo, llm, checks=[flag_check(repo)], agentic_fix=True)
+    assert outcome.status == "approved"
+    assert len(llm.agent_calls) == 1
+    assert llm.fixer_prompts == []
+
+
+def test_agent_changes_are_verified_by_rerunning_the_checks(repo):
+    llm = AgentLLM()  # claims success but changes nothing
+    outcome = run(repo, llm, checks=[flag_check(repo)], agentic_fix=True, max_rounds=2)
+    assert outcome.status == "not_converged"
+    assert all(not c.passed for c in outcome.rounds[-1].checks)
+
+
+def test_agent_runs_after_the_structured_fixer_and_only_if_still_failing(repo):
+    edit = {"file": "ok", "old_str": "", "new_str": "yes\n", "finding_ids": []}
+    llm = AgentLLM({("security", 1): [item()]}, [decision("SEC-1")], [edit])
+    run(repo, llm, checks=[flag_check(repo)], agentic_fix=True, max_rounds=2)
+    assert len(llm.fixer_prompts) == 1
+    assert llm.agent_calls == []
+
+
+def test_agent_changes_reach_reviewers_report_and_backup(repo):
+    (repo / "keep.py").write_text("old\n")
+    subprocess.run(["git", "add", "keep.py"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-qm", "keep", "--", "keep.py"], cwd=repo, check=True, capture_output=True)
+
+    def work():
+        (repo / "app.py").write_text(FIXED)  # already changed by the diff under review
+        (repo / "keep.py").write_text("new\n")  # unchanged until now, so its original comes from git
+        (repo / "ok").write_text("yes\n")  # brand new
+
+    llm = AgentLLM(work=work)
+    seen = []
+    original = llm.structured
+
+    def structured(system, user, schema, tools=None):
+        if schema is REVIEW_SCHEMA:
+            seen.append(user)
+        return original(system, user, schema, tools)
+
+    llm.structured = structured
+    outcome = run(repo, llm, checks=[flag_check(repo)], agentic_fix=True)
+
+    assert outcome.status == "approved"
+    fixes = block(seen[-1], "fixes_since_last_review")
+    assert "b/keep.py" in fixes and "+new" in fixes and "b/ok" in fixes and "b/app.py" in fixes
+    assert "b/keep.py" in outcome.rounds[0].fix_diff
+    assert '<file path="keep.py">' in seen[-1]
+    backup = repo / ".reviewloop/backup"
+    assert (backup / "app.py").read_text() == BUGGY
+    assert (backup / "keep.py").read_text() == "old\n"
+    assert (backup / "ok.did-not-exist").exists()
+    assert "fixed the test" in outcome.rounds[0].fixer_notes
+
+
+def test_agent_failure_still_records_what_it_edited(repo):
+    class Failing(AgentLLM):
+        def agent(self, *a):
+            (repo / "ok").write_text("yes\n")
+            raise llm_module.LLMError("boom")
+
+    outcome = run(repo, Failing(), checks=[flag_check(repo)], agentic_fix=True)
+    assert outcome.status == "approved"
+    assert "check fixer failed: boom" in outcome.rounds[0].fixer_notes
+    assert "b/ok" in outcome.rounds[0].fix_diff
+    assert (repo / ".reviewloop/backup/ok.did-not-exist").exists()
+
+
+def test_binary_file_changed_by_the_agent_is_backed_up_exactly(repo):
+    data = b"\x00\xff\xfe"
+    (repo / "blob.bin").write_bytes(data)
+
+    def work():
+        (repo / "blob.bin").write_bytes(b"\x01")
+        (repo / "ok").write_text("yes\n")
+
+    run(repo, AgentLLM(work=work), checks=[flag_check(repo)], agentic_fix=True)
+    assert (repo / ".reviewloop/backup/blob.bin").read_bytes() == data
+
+
+def test_agent_permissions_are_exact_commands_inside_the_repo(repo):
+    (repo / ".gitignore").write_text("credentials.json\nbuild/\n")
+    (repo / "credentials.json").write_text("secret")
+    (repo / "build").mkdir()
+    (repo / "build/x").write_text("x")
+    check = flag_check(repo)
+    llm = AgentLLM(work=lambda: (repo / "ok").write_text("yes\n"))
+    run(repo, llm, checks=[check, "bad && worse"], agentic_fix=True)
+
+    call = llm.agent_calls[0]
+    assert f"Bash({check})" in call["allowed"]
+    assert not any("worse" in rule for rule in call["allowed"])
+    assert not any(rule in call["allowed"] for rule in ("Bash", "Edit", "Write", "Read"))
+    assert all(rule.startswith("Bash(") or rule.endswith("(./**)") for rule in call["allowed"])
+    for rule in ("Read(./credentials.json)", "Edit(./credentials.json)", "Read(./build/**)", "Edit(./build/**)",
+                 "Read(./.env*)", "Edit(./.env*)", "Edit(./.git/**)", "Edit(./.reviewloop/**)"):
+        assert rule in call["denied"]
+    assert "bad && worse" in call["user"].split("You can run exactly these commands:")[0]
+    assert "bad && worse" not in call["user"].split("You can run exactly these commands:")[1]
+
+
+def test_agent_does_not_run_with_too_many_ignored_paths(repo, monkeypatch):
+    monkeypatch.setattr(context, "MAX_DENY_RULES", 1)
+    (repo / ".gitignore").write_text("a\nb\n")
+    (repo / "a").write_text("")
+    (repo / "b").write_text("")
+    llm = AgentLLM()
+    run(repo, llm, checks=[flag_check(repo)], agentic_fix=True, max_rounds=2)
+    assert llm.agent_calls == []
+
+
+@pytest.mark.parametrize("command", ["pytest tests/*.py", "a && b", "a; b", "a | b", "a > f", "$(a)", "`a`", "a\nb", "(a)"])
+def test_commands_that_cannot_be_limited_are_left_out(command):
+    assert context.scopable_checks([command]) == []
+
+
+@pytest.mark.parametrize("command", ["pytest -q", "ruff check .", "python -m pytest -k 'a or b'", "./check.sh"])
+def test_plain_commands_can_be_limited(command):
+    assert context.scopable_checks([command]) == [command]
+
+
+def test_agent_is_off_by_default(repo):
+    llm = AgentLLM()
+    run(repo, llm, checks=[flag_check(repo)], max_rounds=2)
+    assert llm.agent_calls == []
+    assert len(llm.fixer_prompts) == 1
+
+
+def test_last_round_does_not_run_the_agent(repo):
+    llm = AgentLLM()
+    run(repo, llm, checks=[flag_check(repo)], agentic_fix=True, max_rounds=1)
+    assert llm.agent_calls == []
+
+
+@pytest.mark.parametrize("flags, message", [
+    (["--check", "pytest", "--backend", "api"], "--backend claude-code"),
+    (["--check", "pytest", "--no-fix"], "--no-fix"),
+    ([], "at least one --check"),
+    (["--check", "a && b"], "plain --check"),
+])
+def test_agentic_fix_usage_errors(repo, monkeypatch, capsys, flags, message):
+    monkeypatch.setattr(cli, "ClaudeCodeLLM", lambda **_: pytest.fail("no model call expected"))
+    monkeypatch.setattr(cli, "ApiLLM", lambda **_: pytest.fail("no model call expected"))
+    assert cli.main(["--repo", str(repo), "-y", "--agentic-fix", *flags]) == 2
+    assert message in capsys.readouterr().err
+
+
+def test_agentic_fix_warns_about_a_command_it_cannot_run(repo, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "ClaudeCodeLLM", lambda **_: AgentLLM())
+    assert cli.main(["--repo", str(repo), "-y", "--agentic-fix", "--check", "true", "--check", "true && true"]) == 0
+    assert "can't run 'true && true'" in capsys.readouterr().err
+
+
+def test_claude_code_agent_passes_rules_as_separate_arguments(monkeypatch):
+    monkeypatch.setattr(llm_module.shutil, "which", lambda _: "/bin/claude")
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append((cmd, kw))
+        output = json.dumps({"subtype": "success", "structured_output": {"notes": ""}})
+        return subprocess.CompletedProcess(cmd, 0, output, "")
+
+    monkeypatch.setattr(llm_module.subprocess, "run", fake_run)
+    llm_module.ClaudeCodeLLM().agent("s", "u", {}, ["Bash(pytest -k 'a,b')", "Edit(./**)"], ["Read(./.env*)"])
+    cmd, kw = calls[0]
+    assert cmd[cmd.index("--permission-mode") + 1] == "dontAsk"
+    at = cmd.index("--allowedTools")
+    assert cmd[at + 1:at + 3] == ["Bash(pytest -k 'a,b')", "Edit(./**)"]
+    assert cmd[cmd.index("--disallowedTools") + 1] == "Read(./.env*)"
+    assert kw["env"]["BASH_DEFAULT_TIMEOUT_MS"] == llm_module.BASH_TIMEOUT_MS
+    assert "--setting-sources" in cmd
+
+    llm_module.ClaudeCodeLLM().structured("s", "u", {})
+    assert "--permission-mode" not in calls[1][0]
+    assert calls[1][1]["env"] is None
+
+
+
+def test_agent_does_not_start_once_the_budget_is_reached(repo):
+    class CostingAgentLLM(AgentLLM):
+        def structured(self, system, user, schema, tools=None):
+            self.usage.add(0, 0, 1.0)
+            return super().structured(system, user, schema, tools)
+
+    llm = CostingAgentLLM()
+    outcome = run(repo, llm, checks=[flag_check(repo)], agentic_fix=True, budget=2.0)
+    assert outcome.status == "over_budget"
+    assert llm.agent_calls == []

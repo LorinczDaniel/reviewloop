@@ -19,6 +19,11 @@ def resolve_in_repo(repo: Path, rel: str) -> Path | None:
     return path
 
 
+def unified_diff(rel: str, old: str, new: str) -> list[str]:
+    return list(difflib.unified_diff(old.splitlines(keepends=True), new.splitlines(keepends=True),
+                                     fromfile=f"a/{rel}", tofile=f"b/{rel}"))
+
+
 def apply_edits(repo: Path, edits: list[dict]) -> tuple[list[EditResult], str, dict[str, str | None]]:
     """Apply edits in order.
 
@@ -61,9 +66,5 @@ def apply_edits(repo: Path, edits: list[dict]) -> tuple[list[EditResult], str, d
     for rel, old_text in before.items():
         path = repo / rel
         new_text = path.read_text() if path.is_file() else ""
-        diff += difflib.unified_diff(
-            (old_text or "").splitlines(keepends=True),
-            new_text.splitlines(keepends=True),
-            fromfile=f"a/{rel}", tofile=f"b/{rel}",
-        )
+        diff += unified_diff(rel, old_text or "", new_text)
     return results, "".join(diff), before

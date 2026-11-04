@@ -9,9 +9,9 @@ from pathlib import Path
 from typing import Callable, Protocol
 
 from . import context, suppressions
-from .edits import EditResult, apply_edits
+from .edits import EditResult, apply_edits, unified_diff
 from .llm import LLMError, Usage
-from .schemas import FIXER_SCHEMA, OVERSEER_SCHEMA, REVIEW_SCHEMA, SEVERITIES, Finding
+from .schemas import CHECK_FIXER_SCHEMA, FIXER_SCHEMA, OVERSEER_SCHEMA, REVIEW_SCHEMA, SEVERITIES, Finding
 from .suppressions import Suppression
 
 PROMPTS = package_files("reviewloop") / "prompts"
@@ -41,6 +41,8 @@ class LLM(Protocol):
     usage: Usage
 
     def structured(self, system: str, user: str, schema: dict, tools: list[str] | None = None) -> dict: ...
+
+    def agent(self, system: str, user: str, schema: dict, allowed: list[str], denied: list[str]) -> dict: ...
 
 
 @dataclass(frozen=True)
@@ -82,6 +84,7 @@ class Config:
     out_dir: Path | None = None
     explore: bool = False  # give reviewers read-only repo tools (claude-code backend)
     triage: bool = False  # the user decides on each finding; the overseer doesn't run
+    agentic_fix: bool = False  # let an agent run the checks and edit files itself (claude-code backend)
     budget: float | None = None  # stop once the reported cost reaches this many US dollars
 
 
@@ -180,6 +183,10 @@ class ReviewLoop:
             fix_diff, failed_edits = self._fix(n, ctx, to_fix, failed_edits, rl)
             checks = self._run_checks()
             files = sorted(set(files) | set(context.changed_files(cfg.repo, cfg.base)))
+            if cfg.agentic_fix and any(not c.passed for c in checks) and not self._over_budget():
+                fix_diff += self._fix_checks(files, checks, rules, rl)
+                checks = self._run_checks()
+                files = sorted(set(files) | set(context.changed_files(cfg.repo, cfg.base)))
 
         self.log("Stopped at the round limit with blocking findings still open.")
         return Outcome("not_converged", rounds, self.findings)
@@ -515,7 +522,7 @@ class ReviewLoop:
 
     def _fix(self, n, ctx, to_fix, failed_edits, rl) -> tuple[str, list[EditResult]]:
         failing = [c for c in rl.checks if not c.passed]
-        if not to_fix and not failing:
+        if not to_fix and (not failing or self.cfg.agentic_fix):  # the check fixer handles failures on their own
             return "", []
 
         guidance = {f.id: g for f, g in to_fix}
@@ -557,7 +564,61 @@ class ReviewLoop:
             self.log(f"    rejected {r.file}: {r.message}")
         return diff, failed
 
-    def _backup(self, originals: dict[str, str | None]) -> None:
+    # ---- check fixer -----------------------------------------------------
+
+    def _check_fixer_permissions(self) -> tuple[list[str], list[str]] | None:
+        """Allow edits inside the repo and the exact check commands; deny what must stay private or intact."""
+        cfg = self.cfg
+        commands = context.scopable_checks(cfg.checks)
+        ignored = context.ignored_paths(cfg.repo)
+        if len(ignored) > context.MAX_DENY_RULES:
+            self.log(f"  check fixer: skipped; {len(ignored):,} ignored paths is too many to keep it away from")
+            return None
+        paths = [f"./{p}**" if p.endswith("/") else f"./{p}" for p in ignored]
+        denied = ["Read(./.env*)", "Edit(./.env*)", "Edit(./.git/**)", "Edit(./.reviewloop/**)"]
+        denied += [f"{tool}({path})" for path in paths for tool in ("Read", "Edit")]
+        allowed = ["Read(./**)", "Grep(./**)", "Glob(./**)", "Edit(./**)", *(f"Bash({c})" for c in commands)]
+        return allowed, denied
+
+    def _fix_checks(self, files: list[str], checks: list[context.CheckResult], rules: dict[str, str], rl: RoundLog) -> str:
+        """Let the agent run the checks and edit until they pass. Returns a diff of what it changed."""
+        cfg = self.cfg
+        permissions = self._check_fixer_permissions()
+        if permissions is None:
+            return ""
+        failing = [c for c in checks if not c.passed]
+        now = context.gather(cfg.repo, cfg.base, files, failing, rules)
+        prompt = "\n".join([
+            replace(now, files={}, skipped=[]).render(),
+            "\nThese commands are failing:", *(c.command for c in failing),
+            "You can run exactly these commands:", *context.scopable_checks(cfg.checks),
+        ])
+        system = (PROMPTS / "check_fixer.md").read_text()
+        before = context.snapshot(cfg.repo, cfg.base)
+        self.log(f"  check fixer: working on {len(failing)} failing check(s)...")
+        start = time.monotonic()
+        try:
+            notes = self.llm.agent(system, prompt, CHECK_FIXER_SCHEMA, *permissions)["notes"]
+        except LLMError as e:  # it may have edited files before failing, so still record those
+            notes = f"check fixer failed: {e}"
+            self.log(f"  check fixer: ERROR {e}")
+        rl.fixer_notes = "\n\n".join(filter(None, [rl.fixer_notes, notes]))
+
+        after = context.snapshot(cfg.repo, cfg.base)
+        originals, diff = {}, []
+        for rel in sorted(set(before) | set(after)):
+            old = before[rel] if rel in before else context.base_version(cfg.repo, cfg.base, rel)
+            new = after.get(rel)
+            if old != new:
+                originals[rel] = old
+                diff += unified_diff(rel, (old or b"").decode("utf-8", "replace"), (new or b"").decode("utf-8", "replace"))
+        self._backup(originals)
+        text = "".join(diff)
+        rl.fix_diff += text
+        self.log(f"  check fixer: changed {len(originals)} file(s) ({_elapsed(start)})")
+        return text
+
+    def _backup(self, originals: dict[str, str | bytes | None]) -> None:
         """Keep the pre-review version of every file the fixer touches (first touch wins)."""
         if not self.backup_dir:
             return
@@ -569,5 +630,7 @@ class ReviewLoop:
             dest.parent.mkdir(parents=True, exist_ok=True)
             if text is None:
                 marker.touch()
+            elif isinstance(text, bytes):
+                dest.write_bytes(text)
             else:
                 dest.write_text(text)
