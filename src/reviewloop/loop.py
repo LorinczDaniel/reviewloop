@@ -81,6 +81,7 @@ class Config:
     out_dir: Path | None = None
     explore: bool = False  # give reviewers read-only repo tools (claude-code backend)
     triage: bool = False  # the user decides on each finding; the overseer doesn't run
+    budget: float | None = None  # stop once the reported cost reaches this many US dollars
 
 
 @dataclass
@@ -100,7 +101,7 @@ class RoundLog:
 
 @dataclass
 class Outcome:
-    status: str  # approved | not_converged | report_only | nothing_to_review | triage_aborted
+    status: str  # approved | not_converged | report_only | nothing_to_review | triage_aborted | over_budget
     rounds: list[RoundLog]
     findings: dict[str, Finding]
 
@@ -134,12 +135,19 @@ class ReviewLoop:
         fix_diff, failed_edits = "", []
 
         for n in range(1, cfg.max_rounds + 1):
+            if self._over_budget():
+                return Outcome("over_budget", rounds, self.findings)  # the last fixes are in place but unreviewed
+
             rl = RoundLog(n, checks=checks)
             rounds.append(rl)
             self.log(f"\n── Round {n}/{cfg.max_rounds} " + "─" * 40)
             ctx = context.gather(cfg.repo, cfg.base, files, checks, rules)
 
             self._review(n, ctx, fix_diff, rl)
+
+            if self._over_budget():
+                status = "approved" if self._approved(rl) else "over_budget" if cfg.fix else "report_only"
+                return Outcome(status, rounds, self.findings)
 
             # Triage comes before the approval check so non-blocking findings get a say too.
             # The last round has no review left to verify a fix, so there is nothing to triage.
@@ -163,6 +171,8 @@ class ReviewLoop:
                 if self._approved(rl):
                     self.log("Overseer closed the remaining blocking findings.")
                     return Outcome("approved", rounds, self.findings)
+                if self._over_budget():
+                    return Outcome("over_budget", rounds, self.findings)
 
             fix_diff, failed_edits = self._fix(n, ctx, to_fix, failed_edits, rl)
             checks = self._run_checks()
@@ -170,6 +180,13 @@ class ReviewLoop:
 
         self.log("Stopped at the round limit with blocking findings still open.")
         return Outcome("not_converged", rounds, self.findings)
+
+    def _over_budget(self) -> bool:
+        spent, budget = self.llm.usage.cost_usd, self.cfg.budget
+        if budget is None or spent < budget:
+            return False
+        self.log(f"Budget reached: ${spent:.4f} spent of ${budget:.4f}. Stopping.")
+        return True
 
     def _run_checks(self) -> list[context.CheckResult]:
         if not self.cfg.checks:
