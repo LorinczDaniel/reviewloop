@@ -17,6 +17,7 @@ from .suppressions import Suppression
 PROMPTS = package_files("reviewloop") / "prompts"
 EXPLORE_TOOLS = ["Read", "Grep", "Glob"]
 HEARTBEAT_SECONDS = 30
+TESTS_REVIEWER = "tests"
 TRIAGE_ANSWERS = {
     "f": "fix", "fix": "fix",
     "s": "skip", "skip": "skip",
@@ -265,6 +266,8 @@ class ReviewLoop:
         open_ = [f for f in mine if f.status == "open"]
         closed = [f for f in mine if f.status in CLOSED_STATUSES]
         parts = [ctx.render(), f"\nThis is review round {n}."]
+        if r.name == TESTS_REVIEWER:
+            parts.insert(1, context.related_tests(self.cfg.repo, [*ctx.files, *unchanged]))
         if unchanged:
             parts.append("Unchanged since your last review, so not shown again: " + ", ".join(sorted(unchanged)))
         dismissed = [s for s in self.suppressions
@@ -525,6 +528,8 @@ class ReviewLoop:
                 f = group[0]
                 parts.append(f.full() + (f"\nOverseer guidance: {guidance[f.id]}" if guidance[f.id] else "") + "\n")
         parts.append("</findings_to_fix>")
+        if any(f.reviewer == TESTS_REVIEWER for f, _ in to_fix):  # so it can extend a test file it wasn't otherwise shown
+            parts.append(context.related_tests(self.cfg.repo, list(ctx.files)))
         if failing:
             parts.append("These checks are failing and must pass: " + ", ".join(c.command for c in failing))
         if failed_edits:

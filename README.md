@@ -1,11 +1,12 @@
 # reviewloop
 
-Multi-reviewer code review loop powered by Claude. Specialist reviewers (safety, security, readability) review your diff in parallel. An overseer decides what to do with each finding, and a fixer applies the changes. The loop repeats until no blocking findings remain and your checks pass, or until it hits the round limit and hands off to you.
+Multi-reviewer code review loop powered by Claude. Specialist reviewers (safety, security, readability, tests) review your diff in parallel. An overseer decides what to do with each finding, and a fixer applies the changes. The loop repeats until no blocking findings remain and your checks pass, or until it hits the round limit and hands off to you.
 
 ```
 round N:  safety ─┐
           security ├─► findings ─► all clear? ── yes ─► done
-          readability ┘                │ no
+          readability ┤                │ no
+          tests ──────┘                │
                               overseer: fix / wont_fix / defer
                                        │
                               fixer: exact-string edits ─► run checks ─► round N+1
@@ -150,6 +151,13 @@ Later runs use the file in two ways:
 An overseer dismissal never covers anything that blocks approval: if a finding it closed comes back at a blocking severity, or `--block` now includes that severity, it isn't filtered. Your own decisions hold at any severity. Each entry records `decided_by`, `severity` and `reason`, so you can check them. To bring a finding back, delete its entry; to start over, delete the file. If the file is malformed, the run stops with exit code `2` before any review starts, and the file isn't changed.
 
 The file is per clone, because `.reviewloop` ignores itself in git.
+
+## Tests reviewer
+
+The `tests` reviewer flags changed behaviour that no test would catch breaking. It gets the changed files, plus tracked test files outside the change that mention a changed file's name, up to 100,000 bytes. They're matched by name only, so it rates a gap minor when it can't be sure no test exists. When it finds a gap, the fixer gets the same test files, so it can extend one instead of starting a new file.
+
+It uses one more model call per round. To leave it out, list the others: `--reviewers safety,security,readability`. A test the fixer writes is only run if you pass it through `--check`, so use `--check` to confirm new tests pass.
+
 
 ## Models
 

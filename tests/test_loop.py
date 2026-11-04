@@ -756,7 +756,7 @@ def test_committed_rules_reach_every_agent_every_round(repo):
 
     llm = RecordingLLM()
     assert run(repo, llm).status == "approved"
-    assert len(llm.prompts["reviewer"]) == 6  # three reviewers, two rounds
+    assert len(llm.prompts["reviewer"]) == 8  # four reviewers, two rounds
     for prompts in llm.prompts.values():
         assert prompts
         assert all("Use camelCase." in rules_block(p) for p in prompts)
@@ -904,7 +904,7 @@ def test_edits_require_unique_match(repo):
 # ---- findings on the same line ----------------------------------------------
 
 QUERY = "return db.execute("
-AREAS = {"safety": "runtime safety", "security": "security", "readability": "human readability"}
+AREAS = {"safety": "runtime safety", "security": "security", "readability": "human readability", "tests": "test coverage"}
 SIGNATURE = "def get_user(db, name):"
 
 
@@ -1091,6 +1091,95 @@ def test_triage_asks_about_each_finding_but_the_fixer_gets_them_together(repo):
     assert not llm.overseer_prompts
     assert next(answers, "used up") == "used up"
     assert "Same line, fix together: app.py:2" in llm.fixer_prompts[0]
+
+
+# ---- tests reviewer -----------------------------------------------------------
+
+
+def test_tests_reviewer_runs_by_default_with_its_own_prefix():
+    tests = next(r for r in load_reviewers() if r.name == "tests")
+    assert tests.prefix == "TES"
+    assert "Your area is test coverage" in tests.system
+
+
+def commit_test_file(repo, rel="tests/test_app.py", text="from app import get_user\n"):
+    (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+    (repo / rel).write_text(text)
+    subprocess.run(["git", "add", rel], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-qm", "test", "--", rel], cwd=repo, check=True, capture_output=True)
+
+
+class AreaPromptLLM(SameLineLLM):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.review_prompts = {}
+
+    def structured(self, system, user, schema, tools=None):
+        if schema is REVIEW_SCHEMA:
+            area = next(a for a, words in AREAS.items() if f"Your area is {words}" in system)
+            self.review_prompts.setdefault(area, user)
+        return super().structured(system, user, schema, tools)
+
+
+def test_only_the_tests_reviewer_gets_existing_tests_of_an_unchanged_file(repo):
+    commit_test_file(repo)
+    llm = AreaPromptLLM({})
+    run(repo, llm)
+    assert '<file path="tests/test_app.py">' in block(llm.review_prompts["tests"], "related_tests")
+    assert "<related_tests>" not in llm.review_prompts["security"]
+
+
+def test_fixer_gets_related_tests_only_for_a_tests_finding(repo):
+    commit_test_file(repo)
+    finding = {("tests", 1): [item(title="no test")]}
+    llm = AreaPromptLLM(finding, [decision("TES-1")])
+    run(repo, llm, max_rounds=2)
+    assert '<file path="tests/test_app.py">' in llm.fixer_prompts[0]
+
+    other = AreaPromptLLM({("security", 1): [item()]}, [decision("SEC-1")])
+    run(repo, other, max_rounds=2)
+    assert "<related_tests>" not in other.fixer_prompts[0]
+
+
+def test_related_tests_match_by_name_and_skip_other_tests(repo):
+    commit_test_file(repo, "tests/test_other.py", "import unrelated\n")
+    commit_test_file(repo, "tests/test_mentions.py", "import app\n")
+    commit_test_file(repo, "docs/app_notes.md", "about app\n")
+    shown = context.related_tests(repo, ["app.py"])
+    assert "tests/test_mentions.py" in shown
+    assert "tests/test_other.py" not in shown and "docs/app_notes.md" not in shown
+
+
+def test_related_tests_leave_out_changed_files_and_untracked_ones(repo):
+    commit_test_file(repo)
+    (repo / "tests/test_new.py").write_text("import app\n")
+    assert "test_new" not in context.related_tests(repo, ["app.py"])
+    assert context.related_tests(repo, ["app.py", "tests/test_app.py"]) == ""
+
+
+def test_changes_to_only_test_or_generic_files_look_up_nothing(repo):
+    commit_test_file(repo, "tests/test_app.py", "import index\n")
+    assert context.related_tests(repo, ["tests/test_app.py"]) == ""
+    assert context.related_tests(repo, ["src/index.py"]) == ""
+
+
+def test_related_tests_do_not_follow_symlinks(repo, tmp_path_factory):
+    secret = tmp_path_factory.mktemp("outside") / "secret"
+    secret.write_text("app secret")
+    (repo / "tests").mkdir()
+    (repo / "tests/test_link.py").symlink_to(secret)
+    subprocess.run(["git", "add", "tests/test_link.py"], cwd=repo, check=True, capture_output=True)
+    assert "app secret" not in context.related_tests(repo, ["app.py"])
+
+
+def test_related_tests_over_the_limit_are_named_with_matching_filenames_first(repo, monkeypatch):
+    monkeypatch.setattr(context, "MAX_RELATED_TEST_BYTES", 100)
+    commit_test_file(repo, "tests/a_uses.py", "import app\n" + "x" * 80)
+    commit_test_file(repo, "tests/test_app.py", "import app\n" + "y" * 80)
+    shown = context.related_tests(repo, ["app.py"])
+    assert '<file path="tests/test_app.py">' in shown
+    assert '<file path="tests/a_uses.py">' not in shown
+    assert "not included (over the size limit): tests/a_uses.py" in shown
 
 
 # ---- per-reviewer models ------------------------------------------------------
@@ -1336,23 +1425,23 @@ def test_budget_hit_by_the_first_review_stops_before_the_overseer(repo):
     llm = CostingLLM(BLOCKER, [decision("SEC-1")])
     outcome = run(repo, llm, budget=2.0)
     assert outcome.status == "over_budget"
-    assert llm.calls == ["review"] * 3  # calls already running finish
+    assert llm.calls == ["review"] * 4  # calls already running finish
     assert outcome.findings["SEC-1"].status == "open"
     assert (repo / "app.py").read_text() == BUGGY
 
 
 def test_budget_hit_by_the_overseer_stops_before_the_fixer(repo):
     llm = CostingLLM(BLOCKER, [decision("SEC-1")])
-    outcome = run(repo, llm, budget=3.5)
+    outcome = run(repo, llm, budget=4.5)
     assert outcome.status == "over_budget"
-    assert llm.calls == ["review"] * 3 + ["overseer"]
+    assert llm.calls == ["review"] * 4 + ["overseer"]
 
 
 def test_budget_hit_by_the_fixer_stops_before_the_next_review(repo):
     llm = CostingLLM(BLOCKER, [decision("SEC-1")], [EDIT_SIGNATURE])
-    outcome = run(repo, llm, budget=4.5)
+    outcome = run(repo, llm, budget=5.5)
     assert outcome.status == "over_budget"
-    assert llm.calls == ["review"] * 3 + ["overseer", "fixer"]
+    assert llm.calls == ["review"] * 4 + ["overseer", "fixer"]
     assert len(outcome.rounds) == 1
     assert (repo / ".reviewloop/backup/app.py").read_text() == BUGGY  # the unreviewed fix can be undone
 
@@ -1373,7 +1462,7 @@ def test_no_budget_means_no_limit(repo):
 
 
 def test_budget_exactly_reached_counts_as_reached(repo):
-    assert run(repo, CostingLLM(BLOCKER), budget=3.0).status == "over_budget"
+    assert run(repo, CostingLLM(BLOCKER), budget=4.0).status == "over_budget"
 
 
 def test_under_budget_runs_to_the_end(repo):
@@ -1388,7 +1477,7 @@ def test_over_budget_report_and_exit_code(repo, monkeypatch, tmp_path, capsys):
     assert "Over budget" in (out / "report.md").read_text()
     assert "SEC-1" in (out / "report.md").read_text()
     assert json.loads((out / "report.json").read_text())["status"] == "over_budget"
-    assert "Budget reached: $3.0000 spent of $1.0000" in capsys.readouterr().out
+    assert "Budget reached: $4.0000 spent of $1.0000" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "nan", "inf"])
@@ -1412,5 +1501,5 @@ def test_budget_counts_reviewers_on_other_models(repo, named, monkeypatch, capsy
         return original(self, system, user, schema, tools)
 
     monkeypatch.setattr(NamedLLM, "structured", costly)
-    cli.main(["--repo", str(repo), "-y", "--budget", "3"])  # one of the three reviewers is on Sonnet
-    assert "Budget reached: $3.0000" in capsys.readouterr().out
+    cli.main(["--repo", str(repo), "-y", "--budget", "4"])  # one of the four reviewers is on Sonnet
+    assert "Budget reached: $4.0000" in capsys.readouterr().out
