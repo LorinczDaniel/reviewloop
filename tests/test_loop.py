@@ -899,3 +899,195 @@ def test_edits_require_unique_match(repo):
     results, _, _ = apply_edits(repo, [{"file": "dup.py", "old_str": "a", "new_str": "b"}])
     assert not results[0].ok
     assert (repo / "dup.py").read_text() == "a\na\n"
+
+
+# ---- findings on the same line ----------------------------------------------
+
+QUERY = "return db.execute("
+AREAS = {"safety": "runtime safety", "security": "security", "readability": "human readability"}
+SIGNATURE = "def get_user(db, name):"
+
+
+def item(severity="major", quote=QUERY, line=2, title="problem"):
+    return {"severity": severity, "file": "app.py", "line": line, "quote": quote, "title": title,
+            "detail": f"detail of {title}", "suggestion": f"suggestion for {title}"}
+
+
+class SameLineLLM:
+    """Reports the scripted findings per reviewer and round, and records the overseer and fixer prompts."""
+
+    def __init__(self, findings, decisions=(), edits=()):
+        self.usage = Usage()
+        self.findings, self.decisions, self.edits = findings, list(decisions), list(edits)
+        self.overseer_prompts, self.fixer_prompts = [], []
+
+    def structured(self, system, user, schema, tools=None):
+        if schema is REVIEW_SCHEMA:
+            n = int(user.split("This is review round ")[1].split(".")[0])
+            area = next(a for a, words in AREAS.items() if f"Your area is {words}" in system)
+            return {"summary": "", "previous": [], "findings": self.findings.get((area, n), [])}
+        if schema is OVERSEER_SCHEMA:
+            self.overseer_prompts.append(user)
+            return {"summary": "", "decisions": self.decisions}
+        self.fixer_prompts.append(user)
+        return {"notes": "", "edits": self.edits}
+
+
+def decision(id_, action="fix", reason="why", guidance=""):
+    return {"id": id_, "action": action, "reason": reason, "guidance": guidance}
+
+
+def block(prompt, tag):
+    return prompt.split(f"<{tag}>")[1].split(f"</{tag}>")[0]
+
+
+TWO_ON_ONE_LINE = {("security", 1): [item("blocker", title="injection")],
+                   ("readability", 1): [item("minor", title="naming")]}
+
+
+def test_same_line_findings_reach_the_overseer_and_fixer_as_one_group(repo):
+    llm = SameLineLLM(TWO_ON_ONE_LINE, [decision("MERGE-1", guidance="use a parameter")])
+    run(repo, llm, max_rounds=2)
+
+    shown = block(llm.overseer_prompts[0], "open_findings")
+    assert "[MERGE-1] same line: app.py:2" in shown
+    assert shown.count(QUERY) == 1
+    assert "[SEC-1] (blocker) injection" in shown and "[REA-1] (minor) naming" in shown
+    assert "detail of naming" in shown and "suggestion for injection" in shown
+
+    to_fix = block(llm.fixer_prompts[0], "findings_to_fix")
+    assert "Same line, fix together: app.py:2" in to_fix
+    assert to_fix.count(QUERY) == 1
+    assert to_fix.count("Overseer guidance: use a parameter") == 1
+
+
+def test_merged_findings_stay_separate_in_the_outcome_and_report(repo):
+    llm = SameLineLLM(TWO_ON_ONE_LINE, [decision("MERGE-1")])
+    outcome = run(repo, llm, max_rounds=2)
+
+    assert set(outcome.findings) == {"SEC-1", "REA-1"}
+    assert outcome.findings["SEC-1"].reviewer == "security"
+    assert "r1: merged with REA-1 on the same line" in outcome.findings["SEC-1"].history
+    written = report.write(outcome, repo / ".reviewloop", Usage()).read_text()
+    assert "SEC-1" in written and "REA-1" in written and "merged with" in written
+    assert all(d["id"] in outcome.findings for d in outcome.rounds[0].decisions)
+
+
+def test_group_wont_fix_cannot_close_a_blocker(repo):
+    llm = SameLineLLM(TWO_ON_ONE_LINE, [decision("MERGE-1", "wont_fix", "not real")])
+    outcome = run(repo, llm, max_rounds=2)
+
+    assert outcome.status == "not_converged"
+    assert outcome.findings["SEC-1"].status == "open"
+    assert outcome.findings["REA-1"].status == "wont_fix"
+    assert "[SEC-1]" in llm.fixer_prompts[0] and "[REA-1]" not in llm.fixer_prompts[0]
+
+
+def test_group_defer_cannot_defer_a_blocking_finding(repo):
+    llm = SameLineLLM(TWO_ON_ONE_LINE, [decision("MERGE-1", "defer")])
+    outcome = run(repo, llm, max_rounds=2)
+    assert outcome.findings["SEC-1"].status == "open"
+    assert outcome.findings["REA-1"].status == "deferred"
+
+
+def test_group_wont_fix_on_majors_closes_them_without_saving(repo):
+    findings = {("security", 1): [item(title="a")], ("readability", 1): [item(title="b")]}
+    outcome = run(repo, SameLineLLM(findings, [decision("MERGE-1", "wont_fix", "out of scope")]), max_rounds=2)
+    assert outcome.status == "approved"
+    assert {f.status for f in outcome.findings.values()} == {"wont_fix"}
+    assert not suppressions_file(repo).exists()
+
+
+def test_decision_on_one_finding_overrides_its_group(repo):
+    findings = {("security", 1): [item(title="real")], ("readability", 1): [item(title="wrong")]}
+    llm = SameLineLLM(findings, [decision("MERGE-1"), decision("REA-1", "wont_fix", "false positive")])
+    outcome = run(repo, llm, max_rounds=2)
+    assert outcome.findings["SEC-1"].status == "open"
+    assert outcome.findings["REA-1"].status == "wont_fix"
+    assert "Same line" not in llm.fixer_prompts[0]
+
+
+def test_overseer_returning_no_group_decision_uses_the_defaults(repo):
+    outcome = run(repo, SameLineLLM(TWO_ON_ONE_LINE), max_rounds=2)
+    assert outcome.findings["SEC-1"].status == "open"
+    assert outcome.findings["REA-1"].status == "deferred"
+
+
+def test_one_reviewer_on_one_line_is_not_merged(repo):
+    findings = {("security", 1): [item(title="a"), item(title="b")]}
+    llm = SameLineLLM(findings, [decision("SEC-1"), decision("SEC-2")])
+    run(repo, llm, max_rounds=2)
+    assert "MERGE-" not in llm.overseer_prompts[0]
+    assert "Same line" not in llm.fixer_prompts[0]
+
+
+def test_extra_finding_from_a_merged_reviewer_joins_the_group(repo):
+    findings = {("security", 1): [item(title="a"), item(title="b")], ("readability", 1): [item(title="c")]}
+    llm = SameLineLLM(findings, [decision("MERGE-1")])
+    outcome = run(repo, llm, max_rounds=2)
+    assert block(llm.fixer_prompts[0], "findings_to_fix").count("[") == 3
+    assert len(outcome.rounds[0].decisions) == 3
+
+
+def test_different_lines_are_not_merged(repo):
+    findings = {("security", 1): [item()], ("readability", 1): [item(quote=SIGNATURE, line=1)]}
+    llm = SameLineLLM(findings, [decision("SEC-1"), decision("REA-1")])
+    run(repo, llm, max_rounds=2)
+    assert "MERGE-" not in llm.overseer_prompts[0]
+
+
+def test_each_line_gets_its_own_group(repo):
+    findings = {("security", 1): [item(), item(quote=SIGNATURE, line=1)],
+                ("readability", 1): [item(), item(quote=SIGNATURE, line=1)]}
+    llm = SameLineLLM(findings, [decision("MERGE-1"), decision("MERGE-2")])
+    outcome = run(repo, llm, max_rounds=2)
+    assert "app.py:2" in block(llm.overseer_prompts[0], "open_findings")
+    assert "MERGE-2" in llm.overseer_prompts[0] and "MERGE-3" not in llm.overseer_prompts[0]
+    assert len(outcome.rounds[0].decisions) == 4
+
+
+def test_unverified_findings_are_not_merged(repo):
+    # The reported line matches, but the quote isn't in the file, so the location can't be trusted.
+    findings = {("security", 1): [item("blocker", quote="not in the file")], ("readability", 1): [item()]}
+    llm = SameLineLLM(findings, [decision("SEC-1"), decision("REA-1")])
+    outcome = run(repo, llm, max_rounds=2)
+    assert outcome.findings["SEC-1"].verified is False
+    assert "MERGE-" not in llm.overseer_prompts[0]
+
+
+def test_removed_code_is_not_merged_by_its_line(repo):
+    # Both quotes are only in the base version, so neither has a line in the current file.
+    (repo / "app.py").write_text("removed = 1\n")
+    commit_all(repo)
+    (repo / "app.py").write_text(BUGGY)
+    findings = {("security", 1): [item(quote="removed = 1", line=0)],
+                ("readability", 1): [item(quote="removed = 1", line=0)]}
+    llm = SameLineLLM(findings, [decision("SEC-1"), decision("REA-1")])
+    run(repo, llm, max_rounds=2)
+    assert "MERGE-" not in llm.overseer_prompts[0]
+
+
+def test_grouping_uses_where_the_code_is_now_not_the_recorded_line(repo):
+    # A fix pushes the query down a line, so SEC-1's recorded line 2 now holds the signature.
+    findings = {("security", 1): [item(title="old")],
+                ("readability", 2): [item(quote=SIGNATURE, line=2, title="on line 2 now")],
+                ("safety", 2): [item(line=3, title="on line 3 now")]}
+    edit = {"file": "app.py", "old_str": SIGNATURE, "new_str": f"# note\n{SIGNATURE}", "finding_ids": ["SEC-1"]}
+    llm = SameLineLLM(findings, [decision("SEC-1")], [edit])
+    run(repo, llm, max_rounds=3)
+
+    shown = block(llm.overseer_prompts[1], "open_findings")
+    assert "same line: app.py:3" in shown
+    group = shown.split("same line: app.py:3")[1]
+    assert "[SEC-1]" in group and "[SAF-1]" in group
+    assert "[REA-1] (major) app.py:2" in shown  # stays alone, not merged at its old line
+
+
+def test_triage_asks_about_each_finding_but_the_fixer_gets_them_together(repo):
+    llm = SameLineLLM(TWO_ON_ONE_LINE)
+    answers = iter(["f", "f"])
+    cfg = Config(repo=repo, out_dir=repo / ".reviewloop", triage=True, max_rounds=2)
+    ReviewLoop(cfg, llm, load_reviewers(), log=lambda _: None, ask=lambda _: next(answers)).run()
+    assert not llm.overseer_prompts
+    assert next(answers, "used up") == "used up"
+    assert "Same line, fix together: app.py:2" in llm.fixer_prompts[0]

@@ -352,6 +352,40 @@ class ReviewLoop:
                 return reason
             self.log("  Please give a one-line reason.")
 
+    # ---- same-line groups -------------------------------------------------
+
+    def _same_line_groups(self, findings: list[Finding], files: dict[str, str]) -> list[list[Finding]]:
+        """Group findings that different reviewers raised on one line; the rest stay alone.
+
+        Uses the line each quote is on now, because fixes move code after a finding is
+        recorded. Unverified findings stay alone, since their location can't be trusted.
+        """
+        cfg = self.cfg
+        groups: list[list[Finding]] = []
+        by_line: dict[tuple[str, int], list[Finding]] = {}
+        for f in findings:
+            line = context.locate_quote(cfg.repo, cfg.base, files, f.file, f.quote, f.line) if f.verified else None
+            if not line:
+                groups.append([f])
+            elif (f.file, line) in by_line:
+                by_line[f.file, line].append(f)
+            else:
+                by_line[f.file, line] = [f]
+                groups.append(by_line[f.file, line])
+        split = []
+        for group in groups:
+            split += [group] if len({f.reviewer for f in group}) > 1 else [[f] for f in group]
+        return split
+
+    def _render_group(self, heading: str, group: list[Finding], extra: Callable[[Finding], str], files: dict[str, str]) -> str:
+        """Show one location and its quotes once, then what each reviewer said about it."""
+        line = context.locate_quote(self.cfg.repo, self.cfg.base, files, group[0].file, group[0].quote, group[0].line)
+        quotes = dict.fromkeys(f.quote for f in group)
+        parts = [f"{heading} {group[0].file}:{line}", *(f"Quoted code: {q}" for q in quotes)]
+        for f in sorted(group, key=lambda f: (SEVERITIES.index(f.severity), f.id)):
+            parts += [f.member(), extra(f)]
+        return "\n".join(filter(None, parts)) + "\n"
+
     # ---- overseer --------------------------------------------------------
 
     def _oversee(self, n: int, ctx: context.ReviewContext, rl: RoundLog) -> list[tuple[Finding, str]]:
@@ -360,16 +394,38 @@ class ReviewLoop:
         if not open_:
             return []
 
+        def about(f: Finding) -> str:
+            return f"Reviewer: {f.reviewer}\nHistory: {'; '.join(f.history)}"
+
+        def about_member(f: Finding) -> str:  # the group shows what it's merged with, and "found" says nothing
+            events = [h for h in f.history if not h.endswith(": found") and "on the same line" not in h]
+            return f"Reviewer: {f.reviewer}" + (f"\nHistory: {'; '.join(events)}" if events else "")
+
+        group_of: dict[str, str] = {}  # finding id -> id of its same-line group
+        rendered = []
+        for group in self._same_line_groups(open_, ctx.files):
+            if len(group) == 1:
+                rendered.append(f"{group[0].full()}\n{about(group[0])}\n")
+                continue
+            group_id = f"MERGE-{1 + len(set(group_of.values()))}"
+            group_of |= {f.id: group_id for f in group}
+            for f in group:
+                note = "merged with " + ", ".join(o.id for o in group if o is not f) + " on the same line"
+                if not any(note in h for h in f.history):
+                    f.history.append(f"r{n}: {note}")
+            rendered.append(self._render_group(f"[{group_id}] same line:", group, about_member, ctx.files))
+
         prompt = "\n".join([
             ctx.render(),
             f"\nRound {n} of at most {self.cfg.max_rounds}. Blocking severities: {', '.join(sorted(self.cfg.blocking))}.",
             "Failing checks: " + (", ".join(c.command for c in failing) or "none"),
             "<open_findings>",
-            *(f"{f.full()}\nReviewer: {f.reviewer}\nHistory: {'; '.join(f.history)}\n" for f in open_),
+            *rendered,
             "</open_findings>",
         ])
         system = (PROMPTS / "overseer.md").read_text()
-        self.log(f"  overseer: deciding on {len(open_)} open finding(s)...")
+        merged = f", {len(group_of)} of them merged by line" if group_of else ""
+        self.log(f"  overseer: deciding on {len(open_)} open finding(s){merged}...")
         start = time.monotonic()
         try:
             result = self.llm.structured(system, prompt, OVERSEER_SCHEMA)
@@ -378,11 +434,14 @@ class ReviewLoop:
             result = {"summary": f"overseer failed: {e}", "decisions": []}
 
         rl.overseer_summary = result["summary"]
-        decided = {d["id"]: d for d in result["decisions"] if d["id"] in self.findings}
+        decided = {d["id"]: d for d in result["decisions"]}
         to_fix = []
         for f in open_:
             blocking = f.severity in self.cfg.blocking
-            d = decided.get(f.id) or {"id": f.id, "action": "fix" if blocking else "defer", "reason": "no decision returned", "guidance": ""}
+            # A decision on one finding overrides its group's. The rules below apply to each finding,
+            # so a group decision can't close a blocker or defer anything blocking.
+            d = decided.get(f.id) or decided.get(group_of.get(f.id))
+            d = {**(d or {"action": "fix" if blocking else "defer", "reason": "no decision returned", "guidance": ""}), "id": f.id}
             if d["action"] == "defer" and blocking:
                 d = {**d, "action": "fix", "reason": f"cannot defer a {f.severity}; {d['reason']}"}
             if d["action"] == "wont_fix" and f.severity == "blocker":
@@ -408,9 +467,15 @@ class ReviewLoop:
         if not to_fix and not failing:
             return "", []
 
+        guidance = {f.id: g for f, g in to_fix}
         parts = [ctx.render(), "\n<findings_to_fix>"]
-        for f, guidance in to_fix:
-            parts.append(f.full() + (f"\nOverseer guidance: {guidance}" if guidance else "") + "\n")
+        for group in self._same_line_groups([f for f, _ in to_fix], ctx.files):
+            if len(group) > 1:
+                parts.append(self._render_group("Same line, fix together:", group, lambda f: "", ctx.files))
+                parts += [f"Overseer guidance: {g}\n" for g in dict.fromkeys(guidance[f.id] for f in group) if g]
+            else:
+                f = group[0]
+                parts.append(f.full() + (f"\nOverseer guidance: {guidance[f.id]}" if guidance[f.id] else "") + "\n")
         parts.append("</findings_to_fix>")
         if failing:
             parts.append("These checks are failing and must pass: " + ", ".join(c.command for c in failing))
