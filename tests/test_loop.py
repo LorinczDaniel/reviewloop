@@ -1093,6 +1093,96 @@ def test_triage_asks_about_each_finding_but_the_fixer_gets_them_together(repo):
     assert "Same line, fix together: app.py:2" in llm.fixer_prompts[0]
 
 
+# ---- per-reviewer models ------------------------------------------------------
+
+
+class NamedLLM(FakeLLM):
+    """FakeLLM that records which reviewer systems it answered and which model it is."""
+
+    made = []
+
+    def __init__(self, **kw):
+        super().__init__()
+        self.model, self.effort, self.reviewed = kw["model"], kw["effort"], []
+        self.usage = kw["usage"]
+        NamedLLM.made.append(self)
+
+    def structured(self, system, user, schema, tools=None):
+        if schema is REVIEW_SCHEMA:
+            self.reviewed.append(system)
+        self.usage.add(1, 1)
+        return super().structured(system, user, schema, tools)
+
+
+@pytest.fixture
+def named(monkeypatch):
+    NamedLLM.made = []
+    monkeypatch.setattr(cli, "ClaudeCodeLLM", NamedLLM)
+    return NamedLLM
+
+
+def models_used(named):
+    return [(llm.model, llm.effort) for llm in named.made]
+
+
+def reviewers_on(named, model):
+    return [next(n for n, w in AREAS.items() if f"Your area is {w}" in s)
+            for llm in named.made if llm.model == model for s in llm.reviewed]
+
+
+def test_readability_uses_sonnet_by_default_and_the_rest_opus(repo, named):
+    assert cli.main(["--repo", str(repo), "-y"]) == 0
+    assert models_used(named) == [("claude-opus-5-5", "high"), ("claude-sonnet-5-5", "medium")]
+    assert set(reviewers_on(named, "claude-sonnet-5-5")) == {"readability"}
+    assert "readability" not in reviewers_on(named, "claude-opus-5-5")
+    assert "security" in reviewers_on(named, "claude-opus-5-5")
+
+
+@pytest.mark.parametrize("flags, main_model", [
+    (["--model", "m"], ("m", "high")),
+    (["--effort", "low"], ("claude-opus-5-5", "low")),
+    (["--fast"], ("claude-sonnet-5-5", "medium")),
+])
+def test_choosing_for_the_whole_run_turns_off_the_default_split(repo, named, flags, main_model):
+    assert cli.main(["--repo", str(repo), "-y", *flags]) == 0
+    assert models_used(named) == [main_model]
+
+
+def test_reviewer_model_wins_over_whole_run_flags(repo, named):
+    assert cli.main(["--repo", str(repo), "-y", "--fast", "--reviewer-model", "security=claude-opus-5-5:max"]) == 0
+    assert models_used(named) == [("claude-sonnet-5-5", "medium"), ("claude-opus-5-5", "max")]
+    assert reviewers_on(named, "claude-opus-5-5")[0] == "security"
+
+
+def test_reviewer_model_without_effort_uses_the_runs_effort(repo, named):
+    assert cli.main(["--repo", str(repo), "-y", "--reviewer-model", "readability=m"]) == 0
+    assert ("m", "high") in models_used(named)
+
+
+def test_reviewer_model_id_containing_a_colon_is_kept_whole(repo, named):
+    assert cli.main(["--repo", str(repo), "-y", "--reviewer-model", "security=vendor.model-v1:0"]) == 0
+    assert ("vendor.model-v1:0", "high") in models_used(named)
+
+
+def test_usage_is_totalled_across_models(repo, named, tmp_path):
+    out = tmp_path / "out"
+    assert cli.main(["--repo", str(repo), "-y", "--out", str(out)]) == 0
+    total = json.loads((out / "report.json").read_text())["usage"]["calls"]
+    assert total == sum(len(llm.reviewed) for llm in named.made) + 2  # plus the overseer and fixer
+    assert len(named.made) == 2
+
+
+def test_default_split_skips_a_reviewer_that_is_not_running(repo, named):
+    assert cli.main(["--repo", str(repo), "-y", "--reviewers", "security"]) == 0
+    assert models_used(named) == [("claude-opus-5-5", "high")]
+
+
+@pytest.mark.parametrize("spec", ["readability", "=m", "readability=", "readability=:low", "nobody=m"])
+def test_bad_reviewer_model_is_a_usage_error(repo, named, spec):
+    assert cli.main(["--repo", str(repo), "-y", "--reviewer-model", spec]) == 2
+    assert named.made == []
+
+
 # ---- skipping unchanged files -------------------------------------------------
 
 OTHER = "def other():\n    return 1\n"
@@ -1294,7 +1384,7 @@ def test_under_budget_runs_to_the_end(repo):
 def test_over_budget_report_and_exit_code(repo, monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(cli, "ClaudeCodeLLM", lambda **_: CostingLLM(BLOCKER))
     out = tmp_path / "out"
-    assert cli.main(["--repo", str(repo), "-y", "--budget", "1", "--out", str(out)]) == 1
+    assert cli.main(["--repo", str(repo), "-y", "--fast", "--budget", "1", "--out", str(out)]) == 1
     assert "Over budget" in (out / "report.md").read_text()
     assert "SEC-1" in (out / "report.md").read_text()
     assert json.loads((out / "report.json").read_text())["status"] == "over_budget"
@@ -1312,3 +1402,15 @@ def test_budget_with_the_api_backend_is_a_usage_error(repo, monkeypatch, capsys)
     monkeypatch.setattr(cli, "ApiLLM", lambda **_: pytest.fail("no model call expected"))
     assert cli.main(["--repo", str(repo), "-y", "--budget", "1", "--backend", "api"]) == 2
     assert "doesn't report a cost" in capsys.readouterr().err
+
+
+def test_budget_counts_reviewers_on_other_models(repo, named, monkeypatch, capsys):
+    original = NamedLLM.structured
+
+    def costly(self, system, user, schema, tools=None):
+        self.usage.add(0, 0, 1.0)
+        return original(self, system, user, schema, tools)
+
+    monkeypatch.setattr(NamedLLM, "structured", costly)
+    cli.main(["--repo", str(repo), "-y", "--budget", "3"])  # one of the three reviewers is on Sonnet
+    assert "Budget reached: $3.0000" in capsys.readouterr().out
