@@ -17,6 +17,7 @@ from .suppressions import Suppression
 PROMPTS = package_files("reviewloop") / "prompts"
 EXPLORE_TOOLS = ["Read", "Grep", "Glob"]
 HEARTBEAT_SECONDS = 30
+TESTS_REVIEWER = "tests"
 TRIAGE_ANSWERS = {
     "f": "fix", "fix": "fix",
     "s": "skip", "skip": "skip",
@@ -191,11 +192,12 @@ class ReviewLoop:
 
     def _review(self, n: int, ctx: context.ReviewContext, fix_diff: str, rl: RoundLog) -> None:
         rendered = ctx.render()
+        tests = context.related_tests(self.cfg.repo, list(ctx.files)) if any(r.name == TESTS_REVIEWER for r in self.reviewers) else ""
         start = time.monotonic()
         self.log(f"  reviewing in parallel: {', '.join(r.name for r in self.reviewers)}")
         with ThreadPoolExecutor(max_workers=len(self.reviewers)) as pool:
             pending = {
-                pool.submit(self.llm.structured, r.system, self._review_prompt(r, n, rendered, fix_diff, ctx.files),
+                pool.submit(self.llm.structured, r.system, self._review_prompt(r, n, f"{rendered}\n{tests}" if r.name == TESTS_REVIEWER else rendered, fix_diff, ctx.files),
                             REVIEW_SCHEMA, EXPLORE_TOOLS if self.cfg.explore else None): r
                 for r in self.reviewers
             }
@@ -477,6 +479,8 @@ class ReviewLoop:
                 f = group[0]
                 parts.append(f.full() + (f"\nOverseer guidance: {guidance[f.id]}" if guidance[f.id] else "") + "\n")
         parts.append("</findings_to_fix>")
+        if any(f.reviewer == TESTS_REVIEWER for f, _ in to_fix):  # so it can extend a test file it wasn't otherwise shown
+            parts.append(context.related_tests(self.cfg.repo, list(ctx.files)))
         if failing:
             parts.append("These checks are failing and must pass: " + ", ".join(c.command for c in failing))
         if failed_edits:

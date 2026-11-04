@@ -18,7 +18,7 @@ EXIT = {"approved": 0, "nothing_to_review": 0, "report_only": 0, "not_converged"
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="reviewloop",
-        description="Multi-reviewer code review loop: safety, security and readability reviewers "
+        description="Multi-reviewer code review loop: safety, security, readability and tests reviewers "
                     "review the diff, an overseer arbitrates, a fixer applies changes, repeat.",
     )
     p.add_argument("--repo", type=Path, default=Path.cwd(), help="git repository to review (default: cwd)")
