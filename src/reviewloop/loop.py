@@ -107,8 +107,9 @@ class Outcome:
 
 class ReviewLoop:
     def __init__(self, cfg: Config, llm: LLM, reviewers: list[Reviewer], log: Callable[[str], None] = print,
-                 ask: Callable[[str], str] = input):
+                 ask: Callable[[str], str] = input, reviewer_llms: dict[str, LLM] | None = None):
         self.cfg, self.llm, self.reviewers, self.log, self.ask = cfg, llm, reviewers, log, ask
+        self.reviewer_llms = reviewer_llms or {}  # reviewers that don't use the main model
         self.findings: dict[str, Finding] = {}
         self.marked_fix: set[str] = set()  # finding ids the user sent to the fixer in triage
         self.counters = {r.prefix: 0 for r in reviewers}
@@ -195,7 +196,7 @@ class ReviewLoop:
         self.log(f"  reviewing in parallel: {', '.join(r.name for r in self.reviewers)}")
         with ThreadPoolExecutor(max_workers=len(self.reviewers)) as pool:
             pending = {
-                pool.submit(self.llm.structured, r.system, self._review_prompt(r, n, rendered, fix_diff, ctx.files),
+                pool.submit(self.reviewer_llms.get(r.name, self.llm).structured, r.system, self._review_prompt(r, n, rendered, fix_diff, ctx.files),
                             REVIEW_SCHEMA, EXPLORE_TOOLS if self.cfg.explore else None): r
                 for r in self.reviewers
             }

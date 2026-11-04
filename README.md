@@ -74,7 +74,8 @@ By default each agent is a headless `claude -p` call on your Claude Code login, 
 | `--max-rounds N` | `4` | Stop and hand back to you after N rounds |
 | `--block LIST` | `blocker,major` | Severities that block approval |
 | `--fast` | off | Claude Sonnet 5.5 at medium effort instead of Claude Opus 5.5 at high. Quicker; use the default for security-sensitive code |
-| `--model`, `--effort` | `claude-opus-5-5`, `high` | Choose the model and effort directly |
+| `--model`, `--effort` | `claude-opus-5-5`, `high` | Choose the model and effort directly. Either one also turns off the default Sonnet for readability |
+| `--reviewer-model NAME=MODEL[:EFFORT]` | `readability=claude-sonnet-5-5:medium` | Choose one reviewer's model, e.g. `security=claude-opus-5-5:max`. Repeatable; without an effort it uses the run's |
 | `--explore` | off | Reviewers can read and grep the whole repo, not just the diff. Slower, but catches issues in surrounding code |
 | `--reviewers LIST` | all | Run only some reviewers, e.g. `safety,security` |
 | `--reviewer-dir DIR` | none | Add your own reviewers (see below) |
@@ -139,6 +140,12 @@ Later runs use the file in two ways:
 An overseer dismissal never covers anything that blocks approval: if a finding it closed comes back at a blocking severity, or `--block` now includes that severity, it isn't filtered. Your own decisions hold at any severity. Each entry records `decided_by`, `severity` and `reason`, so you can check them. To bring a finding back, delete its entry; to start over, delete the file. If the file is malformed, the run stops with exit code `2` before any review starts, and the file isn't changed.
 
 The file is per clone, because `.reviewloop` ignores itself in git.
+
+## Models
+
+By default, every agent uses Claude Opus 5.5 at high effort except the readability reviewer, which uses Claude Sonnet 5.5 at medium, because style findings rarely need the top model. The log shows any reviewer that isn't on the main model.
+
+`--reviewer-model` always wins. Otherwise, passing `--model`, `--effort` or `--fast` means you've chosen for the whole run, so readability uses that choice too. To keep Opus on readability, pass `--reviewer-model readability=claude-opus-5-5:high`. The overseer and fixer always use the main model.
 
 ## Custom reviewers
 
