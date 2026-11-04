@@ -66,6 +66,8 @@ FIXER_SCHEMA = _obj({
     },
 })
 
+CHECK_FIXER_SCHEMA = _obj({"notes": _STR})
+
 
 @dataclass
 class Finding:

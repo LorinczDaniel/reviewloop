@@ -28,6 +28,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help=f"comma-separated severities that block approval (from {','.join(SEVERITIES)})")
     p.add_argument("--check", action="append", default=[], metavar="CMD",
                    help="shell command that must pass, e.g. 'pytest -q' (repeatable)")
+    p.add_argument("--agentic-fix", action="store_true",
+                   help="when checks fail, let an agent run them and edit files until they pass "
+                        "(claude-code backend; needs --check). It can run only the exact --check commands")
     p.add_argument("--no-fix", action="store_true", help="review once and report, without changing any files")
     p.add_argument("--triage", action="store_true",
                    help="mark each finding fix, skip or false positive yourself, instead of running the overseer")
@@ -60,6 +63,22 @@ def main(argv=None) -> int:
         print(f"error: --block must be a subset of {SEVERITIES}", file=sys.stderr)
         return 2
 
+    if args.agentic_fix:
+        problem = ("--agentic-fix needs --backend claude-code" if args.backend != "claude-code"
+                   else "--agentic-fix can't be combined with --no-fix, because no fixer runs" if args.no_fix
+                   else "--agentic-fix needs at least one --check" if not args.check
+                   else None)
+        scopable = context.scopable_checks(args.check)
+        if not problem and not scopable:
+            problem = ("--agentic-fix needs a plain --check command it can be limited to; "
+                       "wrap anything using * ( ) & | ; < > $ or backticks in a script")
+        if problem:
+            print(f"error: {problem}", file=sys.stderr)
+            return 2
+        for command in set(args.check) - set(scopable):
+            print(f"warning: --agentic-fix can't run {command!r} because it can't be limited to it; "
+                  "wrap it in a script to include it", file=sys.stderr)
+
     if args.triage:
         problem = ("--triage can't be combined with --no-fix, because no fixer runs" if args.no_fix
                    else "--triage needs --max-rounds of at least 2, so a later round can verify the fixes" if args.max_rounds < 2
@@ -80,12 +99,14 @@ def main(argv=None) -> int:
     (out_dir / ".gitignore").write_text("*\n")  # keep reports out of the reviewed diff
 
     if not args.no_fix and not args.yes:
-        answer = input(f"The fixer will edit files in {repo} (originals are backed up to {out_dir / 'backup'}). Continue? [y/N] ")
+        agent = " An agent may also run your --check commands and edit files directly." if args.agentic_fix else ""
+        answer = input(f"The fixer will edit files in {repo} (originals are backed up to {out_dir / 'backup'}).{agent} Continue? [y/N] ")
         if answer.strip().lower() not in ("y", "yes"):
             return 2
 
     cfg = Config(repo=repo, base=args.base, max_rounds=args.max_rounds, blocking=blocking,
-                 checks=args.check, fix=not args.no_fix, out_dir=out_dir, explore=args.explore, triage=args.triage)
+                 checks=args.check, fix=not args.no_fix, out_dir=out_dir, explore=args.explore, triage=args.triage,
+                 agentic_fix=args.agentic_fix)
     model = args.model or (FAST_MODEL if args.fast else DEFAULT_MODEL)
     effort = args.effort or ("medium" if args.fast else "high")
     try:

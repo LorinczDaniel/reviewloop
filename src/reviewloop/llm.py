@@ -6,6 +6,7 @@ Two interchangeable backends with the same `structured()` method:
 """
 
 import json
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -13,6 +14,7 @@ from pathlib import Path
 
 DEFAULT_MODEL = "claude-opus-5-5"
 CLAUDE_CODE_TIMEOUT = 30 * 60
+BASH_TIMEOUT_MS = "1800000"  # Claude Code's two-minute default would kill most test suites
 
 
 class LLMError(RuntimeError):
@@ -50,6 +52,21 @@ class ClaudeCodeLLM:
         `tools` is a list of built-in tool names (e.g. ["Read", "Grep"]); by
         default the session gets no tools and answers from the prompt alone.
         """
+        return self._run(system, user, schema, tools or [])
+
+    def agent(self, system: str, user: str, schema: dict, allowed: list[str], denied: list[str]) -> dict:
+        """Run a session that can use tools, limited to the `allowed` permission rules.
+
+        Anything else is refused rather than prompted for. Rules are passed one
+        argument each, because a check command can contain spaces or commas.
+        """
+        tools = ["Read", "Grep", "Glob", "Edit", "Write", "Bash"]
+        return self._run(system, user, schema, tools, [
+            "--permission-mode", "dontAsk", "--allowedTools", *allowed, "--disallowedTools", *denied,
+        ], {**os.environ, "BASH_DEFAULT_TIMEOUT_MS": BASH_TIMEOUT_MS, "BASH_MAX_TIMEOUT_MS": BASH_TIMEOUT_MS})
+
+    def _run(self, system: str, user: str, schema: dict, tools: list[str], flags: list[str] | None = None,
+             env: dict[str, str] | None = None) -> dict:
         cmd = [
             "claude", "-p",
             "--output-format", "json",
@@ -57,16 +74,17 @@ class ClaudeCodeLLM:
             "--system-prompt", system,
             "--model", self.model,
             "--effort", self.effort,
-            "--tools", ",".join(tools or []),
+            "--tools", ",".join(tools),
             "--no-session-persistence",
             # Project files can be part of the change under review, so don't let
             # Claude Code auto-load them. Project rules arrive in the prompt instead.
             "--setting-sources", "user",
+            *(flags or []),
         ]
         try:
             proc = subprocess.run(
                 cmd, input=user, capture_output=True, text=True,
-                cwd=self.cwd, timeout=CLAUDE_CODE_TIMEOUT,
+                cwd=self.cwd, timeout=CLAUDE_CODE_TIMEOUT, env=env,
             )
         except subprocess.TimeoutExpired as e:
             raise LLMError(f"claude -p timed out after {CLAUDE_CODE_TIMEOUT}s") from e
