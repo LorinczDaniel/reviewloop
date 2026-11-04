@@ -17,6 +17,7 @@ from .suppressions import Suppression
 PROMPTS = package_files("reviewloop") / "prompts"
 EXPLORE_TOOLS = ["Read", "Grep", "Glob"]
 HEARTBEAT_SECONDS = 30
+TESTS_REVIEWER = "tests"
 TRIAGE_ANSWERS = {
     "f": "fix", "fix": "fix",
     "s": "skip", "skip": "skip",
@@ -84,6 +85,7 @@ class Config:
     explore: bool = False  # give reviewers read-only repo tools (claude-code backend)
     triage: bool = False  # the user decides on each finding; the overseer doesn't run
     agentic_fix: bool = False  # let an agent run the checks and edit files itself (claude-code backend)
+    budget: float | None = None  # stop once the reported cost reaches this many US dollars
 
 
 @dataclass
@@ -103,16 +105,18 @@ class RoundLog:
 
 @dataclass
 class Outcome:
-    status: str  # approved | not_converged | report_only | nothing_to_review | triage_aborted
+    status: str  # approved | not_converged | report_only | nothing_to_review | triage_aborted | over_budget
     rounds: list[RoundLog]
     findings: dict[str, Finding]
 
 
 class ReviewLoop:
     def __init__(self, cfg: Config, llm: LLM, reviewers: list[Reviewer], log: Callable[[str], None] = print,
-                 ask: Callable[[str], str] = input):
+                 ask: Callable[[str], str] = input, reviewer_llms: dict[str, LLM] | None = None):
         self.cfg, self.llm, self.reviewers, self.log, self.ask = cfg, llm, reviewers, log, ask
+        self.reviewer_llms = reviewer_llms or {}  # reviewers that don't use the main model
         self.findings: dict[str, Finding] = {}
+        self.seen: dict[str, dict[str, str]] = {}  # reviewer name -> files as of its last successful review
         self.marked_fix: set[str] = set()  # finding ids the user sent to the fixer in triage
         self.counters = {r.prefix: 0 for r in reviewers}
         self.backup_dir = cfg.out_dir / "backup" if cfg.out_dir else None
@@ -137,12 +141,19 @@ class ReviewLoop:
         fix_diff, failed_edits = "", []
 
         for n in range(1, cfg.max_rounds + 1):
+            if self._over_budget():
+                return Outcome("over_budget", rounds, self.findings)  # the last fixes are in place but unreviewed
+
             rl = RoundLog(n, checks=checks)
             rounds.append(rl)
             self.log(f"\n── Round {n}/{cfg.max_rounds} " + "─" * 40)
             ctx = context.gather(cfg.repo, cfg.base, files, checks, rules)
 
             self._review(n, ctx, fix_diff, rl)
+
+            if self._over_budget():
+                status = "approved" if self._approved(rl) else "over_budget" if cfg.fix else "report_only"
+                return Outcome(status, rounds, self.findings)
 
             # Triage comes before the approval check so non-blocking findings get a say too.
             # The last round has no review left to verify a fix, so there is nothing to triage.
@@ -166,17 +177,26 @@ class ReviewLoop:
                 if self._approved(rl):
                     self.log("Overseer closed the remaining blocking findings.")
                     return Outcome("approved", rounds, self.findings)
+                if self._over_budget():
+                    return Outcome("over_budget", rounds, self.findings)
 
             fix_diff, failed_edits = self._fix(n, ctx, to_fix, failed_edits, rl)
             checks = self._run_checks()
             files = sorted(set(files) | set(context.changed_files(cfg.repo, cfg.base)))
-            if cfg.agentic_fix and any(not c.passed for c in checks):
+            if cfg.agentic_fix and any(not c.passed for c in checks) and not self._over_budget():
                 fix_diff += self._fix_checks(files, checks, rules, rl)
                 checks = self._run_checks()
                 files = sorted(set(files) | set(context.changed_files(cfg.repo, cfg.base)))
 
         self.log("Stopped at the round limit with blocking findings still open.")
         return Outcome("not_converged", rounds, self.findings)
+
+    def _over_budget(self) -> bool:
+        spent, budget = self.llm.usage.cost_usd, self.cfg.budget
+        if budget is None or spent < budget:
+            return False
+        self.log(f"Budget reached: ${spent:.4f} spent of ${budget:.4f}. Stopping.")
+        return True
 
     def _run_checks(self) -> list[context.CheckResult]:
         if not self.cfg.checks:
@@ -197,14 +217,23 @@ class ReviewLoop:
     # ---- reviewers -------------------------------------------------------
 
     def _review(self, n: int, ctx: context.ReviewContext, fix_diff: str, rl: RoundLog) -> None:
-        rendered = ctx.render()
         start = time.monotonic()
-        self.log(f"  reviewing in parallel: {', '.join(r.name for r in self.reviewers)}")
-        with ThreadPoolExecutor(max_workers=len(self.reviewers)) as pool:
+        prompts = {}
+        for r in self.reviewers:
+            mine = self._context_for(r, ctx)
+            if r.name in self.seen and not mine.files and not self._open_findings(r):
+                rl.summaries[r.name] = "Nothing changed since its last review, so it wasn't asked again."
+                self.log(f"  {r.name}: skipped; nothing changed since its last review and no open findings")
+                continue
+            prompts[r] = self._review_prompt(r, n, mine, fix_diff, set(ctx.files) - set(mine.files))
+        if not prompts:
+            return
+        self.log(f"  reviewing in parallel: {', '.join(r.name for r in prompts)}")
+        with ThreadPoolExecutor(max_workers=len(prompts)) as pool:
             pending = {
-                pool.submit(self.llm.structured, r.system, self._review_prompt(r, n, rendered, fix_diff, ctx.files),
-                            REVIEW_SCHEMA, EXPLORE_TOOLS if self.cfg.explore else None): r
-                for r in self.reviewers
+                pool.submit(self.reviewer_llms.get(r.name, self.llm).structured, r.system, prompt, REVIEW_SCHEMA,
+                            EXPLORE_TOOLS if self.cfg.explore else None): r
+                for r, prompt in prompts.items()
             }
             while pending:
                 done, _ = wait(pending, timeout=HEARTBEAT_SECONDS, return_when=FIRST_COMPLETED)
@@ -219,20 +248,42 @@ class ReviewLoop:
                         rl.errors[r.name] = str(e)
                         self.log(f"  {r.name}: ERROR {e} ({_elapsed(start)})")
                         continue
+                    self.seen[r.name] = ctx.files
                     self._record_review(r, n, result, rl, _elapsed(start), ctx.files)
 
-    def _review_prompt(self, r: Reviewer, n: int, rendered: str, fix_diff: str, files: dict[str, str]) -> str:
+    def _open_findings(self, r: Reviewer) -> list[Finding]:
+        return [f for f in self.findings.values() if f.reviewer == r.name and f.status == "open"]
+
+    def _context_for(self, r: Reviewer, ctx: context.ReviewContext) -> context.ReviewContext:
+        """What this reviewer needs: files changed since it last succeeded, and those with its open findings.
+
+        Compares contents rather than tracking the fixer's edits, so a failed call or a
+        formatter run as a check can't hide a change.
+        """
+        seen = self.seen.get(r.name)
+        if seen is None:
+            return ctx
+        keep = {path for path, text in ctx.files.items() if seen.get(path) != text}
+        keep |= {f.file for f in self._open_findings(r) if f.file in ctx.files}
+        return replace(ctx, files={path: text for path, text in ctx.files.items() if path in keep},
+                       diff=context.full_diff(self.cfg.repo, self.cfg.base, sorted(keep)))
+
+    def _review_prompt(self, r: Reviewer, n: int, ctx: context.ReviewContext, fix_diff: str, unchanged: set[str]) -> str:
         mine = [f for f in self.findings.values() if f.reviewer == r.name]
         open_ = [f for f in mine if f.status == "open"]
         closed = [f for f in mine if f.status in CLOSED_STATUSES]
-        parts = [rendered, f"\nThis is review round {n}."]
+        parts = [ctx.render(), f"\nThis is review round {n}."]
+        if r.name == TESTS_REVIEWER:
+            parts.insert(1, context.related_tests(self.cfg.repo, [*ctx.files, *unchanged]))
+        if unchanged:
+            parts.append("Unchanged since your last review, so not shown again: " + ", ".join(sorted(unchanged)))
         dismissed = [s for s in self.suppressions
-                     if s.reviewer == r.name and s.file in files and s.covers(s.severity, self.cfg.blocking)]
+                     if s.reviewer == r.name and s.file in ctx.files and s.covers(s.severity, self.cfg.blocking)]
         if dismissed:
             parts.append("<suppressed_findings>")
             parts += [s.prompt_line() + "\n" for s in dismissed]
             parts.append("</suppressed_findings>")
-        if n == 1:
+        if r.name not in self.seen:  # its first successful review, even if an earlier round's call failed
             parts.append("Review the change in your area.")
             return "\n".join(parts)
         parts.append("<your_open_findings>")
@@ -484,6 +535,8 @@ class ReviewLoop:
                 f = group[0]
                 parts.append(f.full() + (f"\nOverseer guidance: {guidance[f.id]}" if guidance[f.id] else "") + "\n")
         parts.append("</findings_to_fix>")
+        if any(f.reviewer == TESTS_REVIEWER for f, _ in to_fix):  # so it can extend a test file it wasn't otherwise shown
+            parts.append(context.related_tests(self.cfg.repo, list(ctx.files)))
         if failing:
             parts.append("These checks are failing and must pass: " + ", ".join(c.command for c in failing))
         if failed_edits:

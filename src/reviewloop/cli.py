@@ -1,24 +1,27 @@
 """Command-line entry point: `reviewloop [options]`."""
 
 import argparse
+import math
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 from . import context, report
-from .llm import DEFAULT_MODEL, ApiLLM, ClaudeCodeLLM, LLMError
+from .llm import DEFAULT_MODEL, ApiLLM, ClaudeCodeLLM, LLMError, Usage
 from .loop import Config, ReviewLoop, load_reviewers
 from .schemas import SEVERITIES
 
 FAST_MODEL = "claude-sonnet-5-5"
-EXIT = {"approved": 0, "nothing_to_review": 0, "report_only": 0, "not_converged": 1, "triage_aborted": 1}
+EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+DEFAULT_REVIEWER_MODELS = {"readability": (FAST_MODEL, "medium")}  # style rarely needs the top model at high effort
+EXIT = {"approved": 0, "nothing_to_review": 0, "report_only": 0, "not_converged": 1, "triage_aborted": 1, "over_budget": 1}
 
 
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="reviewloop",
-        description="Multi-reviewer code review loop: safety, security and readability reviewers "
+        description="Multi-reviewer code review loop: safety, security, readability and tests reviewers "
                     "review the diff, an overseer arbitrates, a fixer applies changes, repeat.",
     )
     p.add_argument("--repo", type=Path, default=Path.cwd(), help="git repository to review (default: cwd)")
@@ -31,6 +34,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--agentic-fix", action="store_true",
                    help="when checks fail, let an agent run them and edit files until they pass "
                         "(claude-code backend; needs --check). It can run only the exact --check commands")
+    p.add_argument("--budget", type=float, metavar="USD",
+                   help="stop with a report once the cost reaches this many dollars, e.g. 2.00 "
+                        "(claude-code backend only; calls already running finish, so it can go over)")
     p.add_argument("--no-fix", action="store_true", help="review once and report, without changing any files")
     p.add_argument("--triage", action="store_true",
                    help="mark each finding fix, skip or false positive yourself, instead of running the overseer")
@@ -41,13 +47,33 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--explore", action="store_true",
                    help="let reviewers read/grep the rest of the repo for context (claude-code backend only; slower)")
     p.add_argument("--model", help=f"Claude model (default: {DEFAULT_MODEL}, or {FAST_MODEL} with --fast)")
-    p.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"],
+    p.add_argument("--effort", choices=EFFORTS,
                    help="reasoning effort (default: high, or medium with --fast)")
     p.add_argument("--fast", action="store_true",
                    help=f"quicker, cheaper reviews: {FAST_MODEL} at medium effort (--model/--effort still override)")
+    p.add_argument("--reviewer-model", action="append", default=[], metavar="NAME=MODEL[:EFFORT]",
+                   help="model for one reviewer, e.g. readability=claude-sonnet-5-5:medium (repeatable). "
+                        f"Default: {FAST_MODEL} at medium for readability, unless --model, --effort or --fast is set")
     p.add_argument("--out", type=Path, help="report directory (default: <repo>/.reviewloop)")
     p.add_argument("-y", "--yes", action="store_true", help="don't ask before letting the fixer edit files")
     return p.parse_args(argv)
+
+
+def reviewer_models(args: argparse.Namespace, names: set[str], effort: str) -> dict[str, tuple[str, str]]:
+    """Which reviewers don't use the run's model: {name: (model, effort)}."""
+    use_defaults = not (args.model or args.effort or args.fast)
+    chosen = {n: m for n, m in DEFAULT_REVIEWER_MODELS.items() if n in names} if use_defaults else {}
+    for spec in args.reviewer_model:
+        name, _, value = spec.partition("=")
+        if not name or not value:
+            raise ValueError(f"--reviewer-model must look like NAME=MODEL[:EFFORT], got {spec!r}")
+        if name not in names:
+            raise ValueError(f"--reviewer-model: no reviewer called {name!r} in this run (have: {', '.join(sorted(names))})")
+        model, _, suffix = value.rpartition(":")  # model ids can contain ":" themselves
+        chosen[name] = (model, suffix) if suffix in EFFORTS else (value, effort)
+        if not chosen[name][0]:
+            raise ValueError(f"--reviewer-model must look like NAME=MODEL[:EFFORT], got {spec!r}")
+    return chosen
 
 
 def main(argv=None) -> int:
@@ -79,6 +105,14 @@ def main(argv=None) -> int:
             print(f"warning: --agentic-fix can't run {command!r} because it can't be limited to it; "
                   "wrap it in a script to include it", file=sys.stderr)
 
+    if args.budget is not None:
+        problem = ("--budget must be a positive number of dollars" if not (math.isfinite(args.budget) and args.budget > 0)
+                   else "--budget needs --backend claude-code, because the api backend doesn't report a cost" if args.backend != "claude-code"
+                   else None)
+        if problem:
+            print(f"error: {problem}", file=sys.stderr)
+            return 2
+
     if args.triage:
         problem = ("--triage can't be combined with --no-fix, because no fixer runs" if args.no_fix
                    else "--triage needs --max-rounds of at least 2, so a later round can verify the fixes" if args.max_rounds < 2
@@ -90,6 +124,14 @@ def main(argv=None) -> int:
 
     try:
         reviewers = load_reviewers(args.reviewers.split(",") if args.reviewers else None, args.reviewer_dir)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    model = args.model or (FAST_MODEL if args.fast else DEFAULT_MODEL)
+    effort = args.effort or ("medium" if args.fast else "high")
+    try:
+        per_reviewer = reviewer_models(args, {r.name for r in reviewers}, effort)
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -106,20 +148,26 @@ def main(argv=None) -> int:
 
     cfg = Config(repo=repo, base=args.base, max_rounds=args.max_rounds, blocking=blocking,
                  checks=args.check, fix=not args.no_fix, out_dir=out_dir, explore=args.explore, triage=args.triage,
-                 agentic_fix=args.agentic_fix)
-    model = args.model or (FAST_MODEL if args.fast else DEFAULT_MODEL)
-    effort = args.effort or ("medium" if args.fast else "high")
+                 agentic_fix=args.agentic_fix, budget=args.budget)
+    usage = Usage()  # shared, so the report and --budget total every model
+
+    def make_llm(model: str, effort: str):
+        return (ClaudeCodeLLM(model=model, effort=effort, cwd=repo, usage=usage) if args.backend == "claude-code"
+                else ApiLLM(model=model, effort=effort, usage=usage))
+
     try:
-        llm = (ClaudeCodeLLM(model=model, effort=effort, cwd=repo) if args.backend == "claude-code"
-               else ApiLLM(model=model, effort=effort))
+        llm = make_llm(model, effort)
+        reviewer_llms = {name: make_llm(*choice) for name, choice in per_reviewer.items()}
     except LLMError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
     if args.explore and args.backend != "claude-code":
         print("warning: --explore only works with --backend claude-code; ignoring", file=sys.stderr)
     print(f"Model: {model} (effort {effort}) via {args.backend}")
+    for name, (reviewer_model, reviewer_effort) in sorted(per_reviewer.items()):
+        print(f"  {name} reviewer: {reviewer_model} (effort {reviewer_effort})")
     try:
-        loop = ReviewLoop(cfg, llm, reviewers)
+        loop = ReviewLoop(cfg, llm, reviewers, reviewer_llms=reviewer_llms)
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -127,7 +175,7 @@ def main(argv=None) -> int:
     outcome = loop.run()
     minutes, seconds = divmod(int(time.monotonic() - start), 60)
 
-    path = report.write(outcome, out_dir, llm.usage)
+    path = report.write(outcome, out_dir, usage)
     print(f"\n{report.HEADLINES[outcome.status]}\nTook {minutes}m{seconds:02d}s. Report: {path}")
     return EXIT[outcome.status]
 

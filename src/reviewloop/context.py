@@ -12,6 +12,9 @@ MAX_CHECK_OUTPUT = 8_000
 MAX_RULES_BYTES = 20_000
 UNSCOPABLE_COMMAND = re.compile(r"[*()&|;<>$`\n]")  # wildcards, and syntax that makes one line several commands
 MAX_DENY_RULES = 1000
+MAX_RELATED_TEST_BYTES = 100_000
+TEST_PATH = re.compile(r"(^|/)(tests?|specs?|__tests__)/|(^|/)test_[^/]+$|_test\.[^/]+$|\.(test|spec)\.[^/]+$")
+GENERIC_STEMS = {"__init__", "__main__", "index", "main", "mod"}  # these names say nothing about what a test covers
 RULE_FILES = [".reviewloop/rules.md", "CLAUDE.md", "CONTRIBUTING.md"]  # most specific first
 
 
@@ -96,6 +99,40 @@ def load_rules(repo: Path, base: str, changed: list[str]) -> tuple[dict[str, str
         if text:
             rules[rel] = text
     return rules, notes
+
+
+def related_tests(repo: Path, changed: list[str]) -> str:
+    """Render tracked test files that aren't changed but mention a changed file's name.
+
+    Reviewers only see changed files, so without these a test in an untouched file
+    looks missing. Files named after the changed code come first when over the limit.
+    """
+    stems = {Path(f).stem for f in changed if not TEST_PATH.search(f)} - GENERIC_STEMS
+    if not stems:
+        return ""
+    name = re.compile(r"\b(" + "|".join(sorted(map(re.escape, stems))) + r")\b")
+    found = []
+    for rel in git(repo, "ls-files").splitlines():
+        path = repo / rel
+        if rel in changed or not TEST_PATH.search(rel) or path.is_symlink() or not path.is_file():
+            continue
+        data = path.read_bytes()
+        if len(data) > MAX_FILE_BYTES or b"\0" in data[:8000]:
+            continue
+        text = data.decode("utf-8", errors="replace")
+        if name.search(text) or any(stem in Path(rel).name for stem in stems):
+            found.append((not any(stem in Path(rel).name for stem in stems), rel, text))
+
+    parts, omitted, used = [], [], 0
+    for _, rel, text in sorted(found):
+        if used + len(text) > MAX_RELATED_TEST_BYTES:
+            omitted.append(rel)
+            continue
+        used += len(text)
+        parts += [f'<file path="{rel}">', text, "</file>"]
+    if omitted:
+        parts.append("Also related, not included (over the size limit): " + ", ".join(omitted))
+    return "\n".join(["<related_tests>", *parts, "</related_tests>"]) if parts or omitted else ""
 
 
 def _quote_lines(quote: str, text: str) -> list[int]:

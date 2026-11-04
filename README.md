@@ -1,11 +1,12 @@
 # reviewloop
 
-Multi-reviewer code review loop powered by Claude. Specialist reviewers (safety, security, readability) review your diff in parallel. An overseer decides what to do with each finding, and a fixer applies the changes. The loop repeats until no blocking findings remain and your checks pass, or until it hits the round limit and hands off to you.
+Multi-reviewer code review loop powered by Claude. Specialist reviewers (safety, security, readability, tests) review your diff in parallel. An overseer decides what to do with each finding, and a fixer applies the changes. The loop repeats until no blocking findings remain and your checks pass, or until it hits the round limit and hands off to you.
 
 ```
 round N:  safety ─┐
           security ├─► findings ─► all clear? ── yes ─► done
-          readability ┘                │ no
+          readability ┤                │ no
+          tests ──────┘                │
                               overseer: fix / wont_fix / defer
                                        │
                               fixer: exact-string edits ─► run checks ─► round N+1
@@ -69,13 +70,15 @@ By default each agent is a headless `claude -p` call on your Claude Code login, 
 |---|---|---|
 | `--base REF` | `HEAD` | Review changes against this git ref, e.g. `main` |
 | `--agentic-fix` | off | When checks fail, an agent runs them and edits files until they pass. Needs `--check` and the `claude-code` backend; see below |
+| `--budget USD` | none | Stop with a report once the cost reaches this, e.g. `2.00`. Can go over; see below. `claude-code` backend only |
 | `--no-fix` | off | One review pass and a report; no files are changed |
 | `--triage` | off | Mark each finding fix, skip or false positive yourself; the overseer doesn't run. Needs an interactive terminal |
 | `--check CMD` | none | Command that must pass before approval, e.g. `"pytest -q"`. Repeatable |
 | `--max-rounds N` | `4` | Stop and hand back to you after N rounds |
 | `--block LIST` | `blocker,major` | Severities that block approval |
 | `--fast` | off | Claude Sonnet 5.5 at medium effort instead of Claude Opus 5.5 at high. Quicker; use the default for security-sensitive code |
-| `--model`, `--effort` | `claude-opus-5-5`, `high` | Choose the model and effort directly |
+| `--model`, `--effort` | `claude-opus-5-5`, `high` | Choose the model and effort directly. Either one also turns off the default Sonnet for readability |
+| `--reviewer-model NAME=MODEL[:EFFORT]` | `readability=claude-sonnet-5-5:medium` | Choose one reviewer's model, e.g. `security=claude-opus-5-5:max`. Repeatable; without an effort it uses the run's |
 | `--explore` | off | Reviewers can read and grep the whole repo, not just the diff. Slower, but catches issues in surrounding code |
 | `--reviewers LIST` | all | Run only some reviewers, e.g. `safety,security` |
 | `--reviewer-dir DIR` | none | Add your own reviewers (see below) |
@@ -84,13 +87,14 @@ By default each agent is a headless `claude -p` call on your Claude Code login, 
 | `--out DIR` | `<repo>/.reviewloop` | Where reports and backups go |
 | `-y`, `--yes` | off | Don't ask before the fixer edits files |
 
-Exit codes: `0` approved, nothing to review, or report-only; `1` not converged (blocking findings remain) or triage aborted; `2` usage error. This lets you use it in scripts or CI, e.g. `reviewloop -y --check "pytest -q" && git commit`.
+Exit codes: `0` approved, nothing to review, or report-only; `1` not converged (blocking findings remain), triage aborted, or over budget; `2` usage error. This lets you use it in scripts or CI, e.g. `reviewloop -y --check "pytest -q" && git commit`.
 
 ## How it converges
 
 - **Findings must quote the code.** Each finding includes the exact code it's about, and its line number is corrected to where that code actually is. What happens when a quote isn't in the file, or in the base version for code the change removed, depends on severity. Blockers and anything in `--block` stay open and marked `unverified`: they still block approval, and the report lists them in their own "Unverified" group. Other findings are dropped: they don't prompt you or reach the fixer, but they're logged and listed in the report. Indentation, blank lines and leading diff markers (`+`/`-`) are ignored when matching.
 - **Severity gating.** Only `blocker` and `major` findings block approval (`--block` changes this). Minor issues and nits get reported but never hold up the loop.
 - **Re-reviews check earlier findings.** From round 2 on, each reviewer gets its own open findings plus the diff of the latest fixes. It marks each finding resolved or still open, and only adds new issues.
+- **Re-reviews skip unchanged files.** From round 2 on, each reviewer only gets files whose contents changed since its last successful review, plus the files holding its open findings. A reviewer with neither isn't called that round. This saves tokens, but a reviewer may miss a fix breaking code in a file it isn't shown again. Use `--check` to catch that, and `--explore` to let reviewers read those files. The overseer and fixer still get every file.
 - **Findings on the same line are merged.** When different reviewers flag one line, the overseer sees them as a group and normally makes one decision, and the fixer gets them together. The overseer can still decide on each one separately if they're different problems. Each finding keeps its own id, status and place in the report, and each reviewer still checks its own finding in later rounds. Unverified findings are never merged, and `--triage` still asks you about each finding, though the fixer gets the ones you mark as fix grouped the same way.
 - **The overseer settles conflicts.** Priority is safety > security > readability. Findings it closes as `wont_fix` (each with a reason) are not raised again. It cannot defer a blocking finding or close a blocker as `wont_fix`. A blocker the fixer can't resolve stops the run at the round limit, and you can close it yourself with `--triage`.
 - **Hard limits.** `--max-rounds` (default 4), and any failing `--check` blocks approval.
@@ -109,8 +113,17 @@ This agent has more power than the regular fixer, so it's off by default and lim
 - Your `--check` commands run with your full permissions, as they always do. The agent can edit the code they run, so it could get anything into a command that way. Use this on code you'd run yourself, not on untrusted branches.
 - Allow rules in your own `~/.claude` settings still apply to this agent, so a broad rule there gives it more than listed here.
 - Each `--check` command has a 30-minute limit inside the agent.
+- With `--budget`, the agent doesn't start once the limit is reached, but a single agent call can use a lot of tokens, so it can overshoot further than a normal step.
 
 Its edits are backed up like any other fix, except that changes to gitignored files wouldn't be detected, which is one reason it's kept away from them.
+
+## Budget
+
+`--budget 2.00` checks the cost between steps and stops with a normal report once it reaches the limit. The exit code is `1`, unless that review pass was already approved or `--no-fix` was set.
+
+- **It can go over.** Calls that are running finish, and each step can be several parallel reviewers, so a run can overshoot by up to one step. Set it lower than your real limit.
+- **Fixes may be unreviewed.** If it stops right after the fixer ran, those edits stay in your files without a re-review. The report says so. Originals are in `.reviewloop/backup/`, and `git diff` shows the changes.
+- **The cost is Claude Code's figure.** On a Claude plan, that's an estimate rather than what you're billed. `--backend api` doesn't report a cost, so combining it with `--budget` is a usage error rather than a cap that never triggers.
 
 ## Triage
 
@@ -157,6 +170,19 @@ Later runs use the file in two ways:
 An overseer dismissal never covers anything that blocks approval: if a finding it closed comes back at a blocking severity, or `--block` now includes that severity, it isn't filtered. Your own decisions hold at any severity. Each entry records `decided_by`, `severity` and `reason`, so you can check them. To bring a finding back, delete its entry; to start over, delete the file. If the file is malformed, the run stops with exit code `2` before any review starts, and the file isn't changed.
 
 The file is per clone, because `.reviewloop` ignores itself in git.
+
+## Tests reviewer
+
+The `tests` reviewer flags changed behaviour that no test would catch breaking. It gets the changed files, plus tracked test files outside the change that mention a changed file's name, up to 100,000 bytes. They're matched by name only, so it rates a gap minor when it can't be sure no test exists. When it finds a gap, the fixer gets the same test files, so it can extend one instead of starting a new file.
+
+It uses one more model call per round. To leave it out, list the others: `--reviewers safety,security,readability`. A test the fixer writes is only run if you pass it through `--check`, so use `--check` to confirm new tests pass.
+
+
+## Models
+
+By default, every agent uses Claude Opus 5.5 at high effort except the readability reviewer, which uses Claude Sonnet 5.5 at medium, because style findings rarely need the top model. The log shows any reviewer that isn't on the main model.
+
+`--reviewer-model` always wins. Otherwise, passing `--model`, `--effort` or `--fast` means you've chosen for the whole run, so readability uses that choice too. To keep Opus on readability, pass `--reviewer-model readability=claude-opus-5-5:high`. The overseer and fixer always use the main model.
 
 ## Custom reviewers
 
