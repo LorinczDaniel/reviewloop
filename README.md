@@ -195,7 +195,7 @@ Every agent call is one prompt in and one JSON object out, so reviewloop can run
 | `api` | Anthropic API | Needs `ANTHROPIC_API_KEY`. No `--explore`, `--agentic-fix` or `--budget` |
 | `codex` | `codex exec` ([OpenAI Codex CLI](https://github.com/openai/codex)) | Read-only sandbox. Replies are constrained with `--output-schema`. `--effort max` becomes `xhigh` |
 | `gemini` | `gemini -p` ([Gemini CLI](https://github.com/google-gemini/gemini-cli)) | Plan (read-only) approval mode. `--effort` has no effect |
-| `copilot` | `copilot -p` ([GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/use-copilot-cli)) | Only its read tool is available. `--effort` has no effect, and no token counts are reported. The prompt is passed as an argument, so a call whose prompt is over 120 KB fails; use `--reviewers` or a smaller diff |
+| `copilot` | `copilot` ([GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/use-copilot-cli)), prompt on stdin | Only its read-only tools (`view`, `grep`, `glob`). `AGENTS.md` and other custom instructions aren't loaded. `--effort` is only passed when you set it (or `--fast`), because Copilot's default `auto` model rejects any effort |
 | `command` | whatever `--agent-cmd` says | See below |
 
 Install and log in to the harness first; reviewloop uses its login, and its own config, the same way it uses Claude Code's.
@@ -218,7 +218,7 @@ What's different from `claude-code`:
 - **Replies are checked.** Except with Codex, the harness can't enforce the JSON shape, so the prompt asks for it, and the reply is checked here. A reply that doesn't fit counts as that agent failing, like any other error.
 - **Reviewers can read the repo.** Codex, Gemini and Copilot always have their read-only file tools, so reviewers behave as if `--explore` were on. They can't edit files or run commands that change anything. With `command`, what the agent can do is up to the command, and `--explore` is ignored.
 - **No agentic fixer or budget.** `--agentic-fix` needs Claude Code's permission rules to limit the agent to your `--check` commands, and `--budget` needs a cost figure, which only Claude Code reports. Token counts still appear in the report where the harness reports them.
-- **Project files.** Codex is run with `AGENTS.md` loading turned off, so a change can't rewrite its own instructions. Gemini CLI still loads `GEMINI.md` and project `.gemini/` settings from the repo, Copilot CLI still loads its custom instructions (such as `.github/copilot-instructions.md` and `AGENTS.md`), and a `command` agent loads whatever it loads, so with those, a change under review can affect its own review.
+- **Project files.** Codex is run with `AGENTS.md` loading turned off, so a change can't rewrite its own instructions. Copilot is run with `--no-custom-instructions` for the same reason. Gemini CLI still loads `GEMINI.md` and project `.gemini/` settings from the repo, and a `command` agent loads whatever it loads, so with those, a change under review can affect its own review.
 
 ## Custom reviewers
 

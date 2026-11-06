@@ -1838,22 +1838,44 @@ def test_command_backend_failure_is_an_error(monkeypatch):
         llm_module.CommandLLM(command="my-agent").structured("s", "u", REVIEW_SCHEMA)
 
 
-def test_copilot_backend_passes_the_prompt_and_allows_only_reading(monkeypatch):
-    calls = _fake_harness(monkeypatch, lambda cmd, _: ("Here:\n```json\n" + json.dumps(REVIEW_REPLY) + "\n```", 0))
-    assert llm_module.CopilotLLM(model="gpt-x").structured("SYSTEM", "USER", REVIEW_SCHEMA) == REVIEW_REPLY
+def test_copilot_backend_reads_stdin_allows_only_reading_and_counts_tokens(monkeypatch):
+    def respond(cmd, stdin):
+        usage = {"tokenDetails": {"input": {"tokenCount": 5}, "cache_read": {"tokenCount": 2}, "output": {"tokenCount": 1}}}
+        Path(cmd[cmd.index("--usage-output-file") + 1]).write_text(json.dumps(usage))
+        return "Here:\n```json\n" + json.dumps(REVIEW_REPLY) + "\n```", 0
+
+    calls = _fake_harness(monkeypatch, respond)
+    copilot = llm_module.CopilotLLM(model="gpt-x")
+    assert copilot.structured("SYSTEM", "USER", REVIEW_SCHEMA) == REVIEW_REPLY
     cmd = calls[0]["cmd"]
-    prompt = cmd[cmd.index("--prompt") + 1]
-    assert "SYSTEM" in prompt and "USER" in prompt
-    assert {"--silent", "--no-ask-user", "--available-tools=read", "--allow-tool=read"} <= set(cmd)
+    assert "SYSTEM" in calls[0]["stdin"] and "--prompt" not in cmd and "-p" not in cmd
+    assert {"--silent", "--no-ask-user", "--no-custom-instructions",
+            "--available-tools=view,grep,glob", "--allow-tool=read"} <= set(cmd)
     assert not any("allow-all" in a for a in cmd)
     assert cmd[cmd.index("--model") + 1] == "gpt-x"
+    assert "--reasoning-effort" not in cmd  # the default `auto` model rejects one
+    assert (copilot.usage.input_tokens, copilot.usage.output_tokens) == (7, 1)
 
 
-def test_copilot_backend_refuses_a_prompt_too_long_for_an_argument(monkeypatch):
-    calls = _fake_harness(monkeypatch, lambda cmd, _: ("", 0))
-    with pytest.raises(llm_module.LLMError, match="over the"):
-        llm_module.CopilotLLM().structured("s", "x" * llm_module.COPILOT_MAX_PROMPT_BYTES, REVIEW_SCHEMA)
-    assert calls == []
+def test_copilot_backend_passes_a_chosen_effort(monkeypatch):
+    calls = _fake_harness(monkeypatch, lambda cmd, _: (json.dumps(REVIEW_REPLY), 0))
+    llm_module.CopilotLLM(effort="low").structured("s", "u", REVIEW_SCHEMA)
+    assert calls[0]["cmd"][calls[0]["cmd"].index("--reasoning-effort") + 1] == "low"
+
+
+@pytest.mark.parametrize("flags, effort", [([], None), (["--effort", "max"], "max"), (["--fast"], "medium")])
+def test_cli_gives_copilot_an_effort_only_when_chosen(repo, monkeypatch, flags, effort):
+    made = []
+
+    class Recording(FakeLLM):
+        def __init__(self, **kw):
+            super().__init__()
+            made.append(kw)
+            self.usage = kw["usage"]
+
+    monkeypatch.setattr(cli, "CopilotLLM", Recording)
+    assert cli.main(["--repo", str(repo), "-y", "--backend", "copilot", *flags]) == 0
+    assert made[0]["effort"] == effort
 
 
 @pytest.mark.parametrize("cls", [llm_module.CodexLLM, llm_module.GeminiLLM, llm_module.CopilotLLM])

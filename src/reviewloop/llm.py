@@ -370,15 +370,11 @@ class GeminiLLM(_HarnessLLM):
         return validate(extract_json(result["response"]), schema)
 
 
-# Linux caps a single command-line argument at 128 KiB, and Copilot CLI takes the
-# prompt as an argument rather than on stdin.
-COPILOT_MAX_PROMPT_BYTES = 120_000
-
-
 @dataclass
 class CopilotLLM(_HarnessLLM):
-    """`copilot -p` with only its read tool available; the JSON reply is checked here."""
+    """`copilot` with the prompt on stdin and only its read-only tools; the JSON reply is checked here."""
 
+    effort: str | None = None  # None: don't pass one. Copilot's default `auto` model rejects any effort
     name = "copilot"
 
     def __post_init__(self) -> None:
@@ -386,26 +382,36 @@ class CopilotLLM(_HarnessLLM):
             raise LLMError("`copilot` CLI not found on PATH; install GitHub Copilot CLI or pick another --backend")
 
     def structured(self, system: str, user: str, schema: dict, tools: list[str] | None = None) -> dict:
-        """`tools` is ignored: Copilot can always read the repo, but nothing else. `effort` has no flag."""
-        prompt = _harness_prompt(system, user, schema)
-        size = len(prompt.encode())
-        if size > COPILOT_MAX_PROMPT_BYTES:
-            raise LLMError(f"prompt is {size:,} bytes, over the {COPILOT_MAX_PROMPT_BYTES:,} copilot can take as an "
-                           "argument; review fewer files at once or pick another --backend")
-        cmd = [
-            "copilot",
-            "--prompt", prompt,
-            "--silent",  # only the agent's reply, no stats
-            "--no-ask-user",
-            "--available-tools=read",
-            "--allow-tool=read",
-            *(["--model", self.model] if self.model else []),
-        ]
-        proc = self._exec(cmd, "")
-        self.usage.add(0, 0)  # copilot doesn't report tokens in this mode
+        """`tools` is ignored: Copilot can always read the repo, but nothing else."""
+        with tempfile.TemporaryDirectory(prefix="reviewloop-copilot-") as tmp:
+            usage_file = Path(tmp) / "usage.json"
+            cmd = [
+                "copilot",
+                "--silent",  # only the agent's reply, no stats
+                "--no-ask-user",
+                # AGENTS.md and similar files can be part of the change under review,
+                # so don't load them. Project rules arrive in the prompt instead.
+                "--no-custom-instructions",
+                "--available-tools=view,grep,glob",
+                "--allow-tool=read",
+                "--usage-output-file", str(usage_file),
+                *(["--model", self.model] if self.model else []),
+                *(["--reasoning-effort", self.effort] if self.effort else []),
+            ]
+            # With no --prompt, copilot reads the prompt from stdin, which has no size limit.
+            proc = self._exec(cmd, _harness_prompt(system, user, schema))
+            self._add_usage(usage_file)
         if proc.returncode != 0:
             raise self._failed(proc)
         return validate(extract_json(proc.stdout), schema)
+
+    def _add_usage(self, usage_file: Path) -> None:
+        try:
+            details = json.loads(usage_file.read_text()).get("tokenDetails") or {}
+        except (OSError, ValueError, AttributeError):
+            details = {}
+        count = lambda kind: (details.get(kind) or {}).get("tokenCount", 0)  # noqa: E731
+        self.usage.add(count("input") + count("cache_read") + count("cache_write"), count("output"))
 
 
 @dataclass

@@ -180,7 +180,9 @@ def main(argv=None) -> int:
             case "gemini":
                 return GeminiLLM(model=model, effort=effort, cwd=repo, usage=usage)
             case "copilot":
-                return CopilotLLM(model=model, effort=effort, cwd=repo, usage=usage)
+                # Only an effort you chose: Copilot's default `auto` model rejects any effort.
+                chosen = args.effort or ("medium" if args.fast else None)
+                return CopilotLLM(model=model, effort=effort if chosen else None, cwd=repo, usage=usage)
             case _:
                 return CommandLLM(model=model, effort=effort, cwd=repo, usage=usage, command=args.agent_cmd)
 
@@ -194,7 +196,8 @@ def main(argv=None) -> int:
         print(f"warning: --explore doesn't work with --backend {args.backend}; ignoring", file=sys.stderr)
     elif args.backend in ("codex", "gemini", "copilot") and not args.explore:
         print(f"note: {args.backend} agents can always read the repo (read-only), as if --explore were on", file=sys.stderr)
-    print(f"Model: {model or 'harness default'} (effort {effort}) via {args.backend}")
+    effort_shown = f" (effort {effort})" if getattr(llm, "effort", effort) else ""
+    print(f"Model: {model or 'harness default'}{effort_shown} via {args.backend}")
     for name, (reviewer_model, reviewer_effort) in sorted(per_reviewer.items()):
         print(f"  {name} reviewer: {reviewer_model} (effort {reviewer_effort})")
     try:
