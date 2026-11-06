@@ -2,6 +2,8 @@
 
 import io
 import json
+import os
+import sys
 import subprocess
 from pathlib import Path
 
@@ -12,7 +14,7 @@ from reviewloop import llm as llm_module
 from reviewloop.edits import apply_edits
 from reviewloop.llm import Usage
 from reviewloop.loop import Config, ReviewLoop, load_reviewers
-from reviewloop.schemas import FIXER_SCHEMA, OVERSEER_SCHEMA, REVIEW_SCHEMA
+from reviewloop.schemas import CHECK_FIXER_SCHEMA, FIXER_SCHEMA, OVERSEER_SCHEMA, REVIEW_SCHEMA
 
 BUGGY = 'def get_user(db, name):\n    return db.execute(f"SELECT * FROM users WHERE name = \'{name}\'")\n'
 FIXED = 'def get_user(db, name):\n    return db.execute("SELECT * FROM users WHERE name = ?", (name,))\n'
@@ -23,6 +25,8 @@ def only_claude_installed(monkeypatch):
     """CLI tests shouldn't depend on which coding agents this machine has, or on the env var."""
     monkeypatch.delenv(cli.BACKEND_ENV, raising=False)
     monkeypatch.setattr(cli, "installed", lambda command: command == "claude")
+    for name in ("CopilotLLM", "CodexLLM", "GeminiLLM", "CommandLLM"):  # never start a real coding agent
+        monkeypatch.setattr(cli, name, lambda name=name, **_: pytest.fail(f"unexpected real {name}"))
 
 
 @pytest.fixture
@@ -1549,8 +1553,9 @@ class AgentLLM(SameLineLLM):
         super().__init__(findings or {}, *a, **kw)
         self.work, self.agent_calls = work, []
 
-    def agent(self, system, user, schema, allowed, denied):
-        self.agent_calls.append({"system": system, "user": user, "allowed": allowed, "denied": denied})
+    def agent(self, system, user, schema, scope):
+        allowed, denied = llm_module.ClaudeCodeLLM.permission_rules(scope)
+        self.agent_calls.append({"system": system, "user": user, "scope": scope, "allowed": allowed, "denied": denied})
         self.work()
         return {"notes": "fixed the test"}
 
@@ -1697,7 +1702,7 @@ def test_last_round_does_not_run_the_agent(repo):
 
 
 @pytest.mark.parametrize("flags, message", [
-    (["--check", "pytest", "--backend", "api"], "--backend claude-code"),
+    (["--check", "pytest", "--backend", "api"], "--backend claude-code or copilot"),
     (["--check", "pytest", "--no-fix"], "--no-fix"),
     ([], "at least one --check"),
     (["--check", "a && b"], "plain --check"),
@@ -1725,11 +1730,12 @@ def test_claude_code_agent_passes_rules_as_separate_arguments(monkeypatch):
         return subprocess.CompletedProcess(cmd, 0, output, "")
 
     monkeypatch.setattr(llm_module.subprocess, "run", fake_run)
-    llm_module.ClaudeCodeLLM().agent("s", "u", {}, ["Bash(pytest -k 'a,b')", "Edit(./**)"], ["Read(./.env*)"])
+    scope = llm_module.AgentScope(repo=Path("/r"), commands=["pytest -k 'a,b'"], private=[])
+    llm_module.ClaudeCodeLLM().agent("s", "u", {}, scope)
     cmd, kw = calls[0]
     assert cmd[cmd.index("--permission-mode") + 1] == "dontAsk"
     at = cmd.index("--allowedTools")
-    assert cmd[at + 1:at + 3] == ["Bash(pytest -k 'a,b')", "Edit(./**)"]
+    assert "Bash(pytest -k 'a,b')" in cmd[at + 1:cmd.index("--disallowedTools")]
     assert cmd[cmd.index("--disallowedTools") + 1] == "Read(./.env*)"
     assert kw["env"]["BASH_DEFAULT_TIMEOUT_MS"] == llm_module.BASH_TIMEOUT_MS
     assert "--setting-sources" in cmd
@@ -1912,11 +1918,11 @@ def test_cli_gives_copilot_an_effort_only_when_chosen(repo, monkeypatch, flags, 
     assert made[0]["effort"] == effort
 
 
-@pytest.mark.parametrize("cls", [llm_module.CodexLLM, llm_module.GeminiLLM, llm_module.CopilotLLM])
+@pytest.mark.parametrize("cls", [llm_module.CodexLLM, llm_module.GeminiLLM])
 def test_other_harnesses_refuse_the_agentic_fixer(monkeypatch, cls):
     _fake_harness(monkeypatch, lambda cmd, _: ("", 0))
-    with pytest.raises(llm_module.LLMError, match="claude-code"):
-        cls().agent("s", "u", {}, [], [])
+    with pytest.raises(llm_module.LLMError, match="claude-code or copilot"):
+        cls().agent("s", "u", {}, llm_module.AgentScope(repo=Path("."), commands=[], private=[]))
 
 
 @pytest.mark.parametrize("backend", ["codex", "gemini", "copilot", "command"])
@@ -1941,7 +1947,7 @@ def test_cli_other_harness_uses_its_own_default_model_everywhere(repo, monkeypat
     (["--backend", "command"], "needs --agent-cmd"),
     (["--agent-cmd", "x"], "only works with --backend command"),
     (["--backend", "codex", "--budget", "1"], "codex backend doesn't report a cost"),
-    (["--backend", "gemini", "--agentic-fix", "--check", "true"], "needs --backend claude-code"),
+    (["--backend", "gemini", "--agentic-fix", "--check", "true"], "needs --backend claude-code or copilot"),
 ])
 def test_cli_rejects_harness_flag_combinations(repo, monkeypatch, capsys, flags, message):
     monkeypatch.setattr(cli, "ClaudeCodeLLM", lambda **_: pytest.fail("no model call expected"))
@@ -2000,6 +2006,114 @@ def test_no_harness_installed_is_a_usage_error(repo, monkeypatch, capsys):
 
 
 def test_flags_are_checked_against_the_detected_backend(repo, monkeypatch, capsys):
-    monkeypatch.setattr(cli, "installed", lambda command: command == "copilot")
+    monkeypatch.setattr(cli, "installed", lambda command: command == "gemini")
     assert cli.main(["--repo", str(repo), "-y", "--budget", "1"]) == 2
-    assert "copilot backend doesn't report a cost" in capsys.readouterr().err
+    assert "gemini backend doesn't report a cost" in capsys.readouterr().err
+
+
+# ---- copilot agentic fixer and budget --------------------------------------
+
+def _copilot_agent_run(monkeypatch, tmp_path, commands, private=(), usage=None):
+    """Run CopilotLLM.agent against a fake copilot; return the llm, the call, and the MCP config it got."""
+    seen = {}
+
+    def respond(cmd, stdin):
+        server = json.loads(cmd[cmd.index("--additional-mcp-config") + 1])["mcpServers"]["reviewloop"]
+        seen["server"] = server
+        seen["config"] = json.loads(Path(server["args"][-1]).read_text())
+        if usage is not None:
+            Path(cmd[cmd.index("--usage-output-file") + 1]).write_text(json.dumps(usage))
+        return json.dumps({"notes": "done"}), 0
+
+    calls = _fake_harness(monkeypatch, respond)
+    llm = llm_module.CopilotLLM(cwd=tmp_path)
+    scope = llm_module.AgentScope(repo=tmp_path, commands=list(commands), private=list(private))
+    assert llm.agent("SYSTEM", "USER", CHECK_FIXER_SCHEMA, scope) == {"notes": "done"}
+    return llm, calls[0], seen
+
+
+def test_copilot_agent_has_no_shell_and_runs_checks_through_the_mcp_tool(monkeypatch, tmp_path):
+    _, call, seen = _copilot_agent_run(monkeypatch, tmp_path, ["pytest -q", "ruff check ."])
+    cmd = call["cmd"]
+    tools = next(a for a in cmd if a.startswith("--available-tools="))
+    assert tools == "--available-tools=view,glob,edit,create,reviewloop-run_check"
+    assert "--allow-tool=reviewloop(run_check)" in cmd
+    assert not any(a.startswith("--allow-tool=shell") or "allow-all" in a for a in cmd)
+    assert {"--disallow-temp-dir", "--disable-builtin-mcps", "--no-custom-instructions"} <= set(cmd)
+    assert seen["server"]["args"][:3] == ["-I", "-m", "reviewloop.check_server"]
+    assert seen["config"] == {"repo": str(tmp_path), "commands": ["pytest -q", "ruff check ."]}
+    assert "1: pytest -q" in call["stdin"] and "2: ruff check ." in call["stdin"]
+    assert not Path(seen["server"]["args"][-1]).exists()  # config is removed afterwards
+
+
+def test_copilot_agent_keeps_private_and_protected_paths_out(monkeypatch, tmp_path):
+    _, call, _ = _copilot_agent_run(monkeypatch, tmp_path, ["pytest"], private=["secret.json", "build/", "we*rd"])
+    repo = str(tmp_path.resolve())
+    cmd = call["cmd"]
+    for rule in (f"--allow-tool=read({repo}/**)", f"--allow-tool=write({repo}/**)",
+                 f"--deny-tool=read({repo}/secret.json)", f"--deny-tool=write({repo}/secret.json)",
+                 f"--deny-tool=read({repo}/build/**)", f"--deny-tool=read({repo}/we[*]rd)",
+                 f"--deny-tool=read({repo}/.env*)", f"--deny-tool=write({repo}/.git/**)",
+                 f"--deny-tool=write({repo}/.reviewloop/**)"):
+        assert rule in cmd
+
+
+def _serve(repo, commands, *requests):
+    """Talk to the check server over real stdio, the way copilot does."""
+    config = repo / "checks.json"
+    config.write_text(json.dumps({"repo": str(repo), "commands": commands}))
+    lines = "".join(json.dumps(r) + "\n" for r in requests)
+    proc = subprocess.run([sys.executable, "-I", "-m", "reviewloop.check_server", str(config)],
+                          input=lines, capture_output=True, text=True, check=True)
+    return [json.loads(line) for line in proc.stdout.splitlines()]
+
+
+def test_check_server_lists_one_tool_and_runs_exactly_the_numbered_check(tmp_path):
+    init, listed, ran, failed, bad, extra = _serve(
+        tmp_path, ["echo ran > out.txt && echo hi", "exit 3"],
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "run_check", "arguments": {"number": 1}}},
+        {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "run_check", "arguments": {"number": 2}}},
+        {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "run_check", "arguments": {"number": 3}}},
+        {"jsonrpc": "2.0", "id": 6, "method": "tools/call",
+         "params": {"name": "run_check", "arguments": {"number": 1, "command": "touch pwned"}}},
+    )
+    assert init["result"]["capabilities"] == {"tools": {}}
+    (tool,) = listed["result"]["tools"]
+    assert tool["name"] == "run_check" and "1: echo ran" in tool["description"]
+    assert ran["result"]["isError"] is False and "exit code 0\nhi" in ran["result"]["content"][0]["text"]
+    assert (tmp_path / "out.txt").read_text() == "ran\n"
+    assert "exit code 3" in failed["result"]["content"][0]["text"]
+    assert bad["result"]["isError"] is True
+    assert extra["result"]["isError"] is False and not (tmp_path / "pwned").exists()  # extra arguments are ignored
+
+
+def test_copilot_reports_cost_from_ai_credits(monkeypatch, tmp_path):
+    usage = {"totalNanoAiu": 2_500_000_000, "tokenDetails": {"input": {"tokenCount": 4}, "output": {"tokenCount": 2}}}
+    llm, _, _ = _copilot_agent_run(monkeypatch, tmp_path, ["pytest"], usage=usage)
+    assert llm.usage.cost_usd == pytest.approx(0.025)  # 2.5 AI credits at $0.01
+    assert llm.usage.uncosted_calls == 0
+
+
+def test_copilot_call_without_a_cost_is_counted_as_uncosted(monkeypatch, tmp_path):
+    llm, _, _ = _copilot_agent_run(monkeypatch, tmp_path, ["pytest"], usage={"totalPremiumRequestCost": 1})
+    assert llm.usage.uncosted_calls == 1 and llm.usage.cost_usd == 0
+
+
+def test_budget_stops_when_a_cost_was_not_reported(repo):
+    class UncostedLLM(FakeLLM):
+        def structured(self, system, user, schema, tools=None):
+            self.usage.add(1, 1, None)
+            return super().structured(system, user, schema, tools)
+
+    outcome = run(repo, UncostedLLM(), budget=100.0)
+    assert outcome.status == "over_budget"
+
+
+def test_cli_allows_agentic_fix_and_budget_with_copilot(repo, monkeypatch):
+    monkeypatch.setattr(cli, "CopilotLLM", lambda **kw: AgentLLM(work=lambda: (repo / "ok").write_text("yes\n")))
+    check = flag_check(repo)
+    assert cli.main(["--repo", str(repo), "-y", "--backend", "copilot", "--agentic-fix", "--check", check,
+                     "--budget", "5"]) == 0

@@ -22,6 +22,7 @@ BACKENDS = ["claude-code", "api", "codex", "gemini", "copilot", "command"]
 # Without --backend, the first of these that's installed is used.
 DETECTED = [("claude-code", "claude"), ("copilot", "copilot"), ("codex", "codex"), ("gemini", "gemini")]
 BACKEND_ENV = "REVIEWLOOP_BACKEND"
+AGENT_BACKENDS = {"claude-code", "copilot"}  # can run --agentic-fix, and report a cost for --budget
 EXIT = {"approved": 0, "nothing_to_review": 0, "report_only": 0, "not_converged": 1, "triage_aborted": 1, "over_budget": 1}
 
 
@@ -40,10 +41,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="shell command that must pass, e.g. 'pytest -q' (repeatable)")
     p.add_argument("--agentic-fix", action="store_true",
                    help="when checks fail, let an agent run them and edit files until they pass "
-                        "(claude-code backend; needs --check). It can run only the exact --check commands")
+                        "(claude-code or copilot backend; needs --check). It can run only the exact --check commands")
     p.add_argument("--budget", type=float, metavar="USD",
                    help="stop with a report once the cost reaches this many dollars, e.g. 2.00 "
-                        "(claude-code backend only; calls already running finish, so it can go over)")
+                        "(claude-code or copilot backend; calls already running finish, so it can go over)")
     p.add_argument("--no-fix", action="store_true", help="review once and report, without changing any files")
     p.add_argument("--triage", action="store_true",
                    help="mark each finding fix, skip or false positive yourself, instead of running the overseer")
@@ -133,8 +134,8 @@ def main(argv=None) -> int:
         return 2
 
     if args.agentic_fix:
-        problem = ("--agentic-fix needs --backend claude-code, the only harness whose tools can be limited to your "
-                   "--check commands" if args.backend != "claude-code"
+        problem = ("--agentic-fix needs --backend claude-code or copilot, the harnesses whose tools can be limited "
+                   "to your --check commands" if args.backend not in AGENT_BACKENDS
                    else "--agentic-fix can't be combined with --no-fix, because no fixer runs" if args.no_fix
                    else "--agentic-fix needs at least one --check" if not args.check
                    else None)
@@ -151,8 +152,8 @@ def main(argv=None) -> int:
 
     if args.budget is not None:
         problem = ("--budget must be a positive number of dollars" if not (math.isfinite(args.budget) and args.budget > 0)
-                   else f"--budget needs --backend claude-code, because the {args.backend} backend doesn't report a cost"
-                   if args.backend != "claude-code"
+                   else f"--budget needs --backend claude-code or copilot, because the {args.backend} backend "
+                        "doesn't report a cost" if args.backend not in AGENT_BACKENDS
                    else None)
         if problem:
             print(f"error: {problem}", file=sys.stderr)

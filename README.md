@@ -69,8 +69,8 @@ Each agent is a headless call to the coding agent you have installed, on its log
 | Option | Default | What it does |
 |---|---|---|
 | `--base REF` | `HEAD` | Review changes against this git ref, e.g. `main` |
-| `--agentic-fix` | off | When checks fail, an agent runs them and edits files until they pass. Needs `--check` and the `claude-code` backend; see below |
-| `--budget USD` | none | Stop with a report once the cost reaches this, e.g. `2.00`. Can go over; see below. `claude-code` backend only |
+| `--agentic-fix` | off | When checks fail, an agent runs them and edits files until they pass. Needs `--check` and the `claude-code` or `copilot` backend; see below |
+| `--budget USD` | none | Stop with a report once the cost reaches this, e.g. `2.00`. Can go over; see below. `claude-code` or `copilot` backend |
 | `--no-fix` | off | One review pass and a report; no files are changed |
 | `--triage` | off | Mark each finding fix, skip or false positive yourself; the overseer doesn't run. Needs an interactive terminal |
 | `--check CMD` | none | Command that must pass before approval, e.g. `"pytest -q"`. Repeatable |
@@ -104,15 +104,16 @@ Exit codes: `0` approved, nothing to review, or report-only; `1` not converged (
 
 Normally a failing check costs a round: the fixer writes edits without running anything, and you only learn whether they worked when the checks run afterwards. With `--agentic-fix`, an agent runs your checks, edits files and reruns them in one call. If findings were also fixed that round, it runs after those edits. reviewloop reruns the checks itself afterwards rather than trusting the agent, and reviewers review its changes in the next round.
 
-This agent has more power than the regular fixer, so it's off by default and limited with Claude Code's permission rules:
+It works with the `claude-code` and `copilot` backends. This agent has more power than the regular fixer, so it's off by default and limited with the harness's permission rules:
 
 - **Commands:** it can only run your exact `--check` commands, with no other arguments. A command containing `*`, `(`, `)`, `&`, `|`, `;`, `<`, `>`, `$` or a backtick can't be limited safely, so the agent can't run it. The loop still does, and you get a warning. To include such a command, put it in a script and pass that.
 - **Files:** it can read and edit inside the repo only. It can't read or edit gitignored files or `.env*`, and it can't edit `.git` or `.reviewloop`. If there are over 1,000 gitignored paths, it doesn't run.
+- **On Copilot, no shell at all.** Copilot's shell rules allow any arguments, and Copilot approves read-only commands like `cat` by itself, which would get past the file rules. So the Copilot agent has no shell, web or content-search tool. It gets the file tools `view`, `glob`, `edit` and `create`, plus a `run_check` tool from reviewloop that runs one of your checks by number, exactly as given.
 
 **What these limits don't cover:**
 
 - Your `--check` commands run with your full permissions, as they always do. The agent can edit the code they run, so it could get anything into a command that way. Use this on code you'd run yourself, not on untrusted branches.
-- Allow rules in your own `~/.claude` settings still apply to this agent, so a broad rule there gives it more than listed here.
+- Allow rules in your own `~/.claude` settings still apply to the Claude Code agent, so a broad rule there gives it more than listed here. The same goes for permissions in your own Copilot settings.
 - Each `--check` command has a 30-minute limit inside the agent.
 - With `--budget`, the agent doesn't start once the limit is reached, but a single agent call can use a lot of tokens, so it can overshoot further than a normal step.
 
@@ -124,7 +125,7 @@ Its edits are backed up like any other fix, except that changes to gitignored fi
 
 - **It can go over.** Calls that are running finish, and each step can be several parallel reviewers, so a run can overshoot by up to one step. Set it lower than your real limit.
 - **Fixes may be unreviewed.** If it stops right after the fixer ran, those edits stay in your files without a re-review. The report says so. Originals are in `.reviewloop/backup/`, and `git diff` shows the changes.
-- **The cost is Claude Code's figure.** On a Claude plan, that's an estimate rather than what you're billed. `--backend api` doesn't report a cost, so combining it with `--budget` is a usage error rather than a cap that never triggers.
+- **The cost is the harness's figure.** Claude Code reports one, which on a Claude plan is an estimate rather than what you're billed. Copilot reports AI credits, converted at GitHub's $0.01 per credit. If a Copilot call reports no credits, as may happen on the older premium-request billing, the run stops, because the budget can't be checked. Other backends don't report a cost, so combining them with `--budget` is a usage error rather than a cap that never triggers.
 
 ## Triage
 
@@ -194,8 +195,8 @@ Every agent call is one prompt in and one JSON object out, so reviewloop can run
 
 | Backend | Runs | Notes |
 |---|---|---|
-| `claude-code` | `claude -p` | Everything works, including `--agentic-fix` and `--budget` |
-| `copilot` | `copilot` ([GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/use-copilot-cli)), prompt on stdin | Only its read-only tools (`view`, `grep`, `glob`). Its own loading of `AGENTS.md` and other custom instructions is off; reviewloop passes them as [project rules](#project-rules) instead. `--effort` is only passed when you set it (or `--fast`), because Copilot's default `auto` model rejects any effort |
+| `claude-code` | `claude -p` | Everything works |
+| `copilot` | `copilot` ([GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/use-copilot-cli)), prompt on stdin | Only its read-only tools (`view`, `grep`, `glob`). Its own loading of `AGENTS.md` and other custom instructions is off; reviewloop passes them as [project rules](#project-rules) instead. `--effort` is only passed when you set it (or `--fast`), because Copilot's default `auto` model rejects any effort. `--agentic-fix` and `--budget` work |
 | `codex` | `codex exec` ([OpenAI Codex CLI](https://github.com/openai/codex)) | Read-only sandbox. Replies are constrained with `--output-schema`. `--effort max` becomes `xhigh` |
 | `gemini` | `gemini -p` ([Gemini CLI](https://github.com/google-gemini/gemini-cli)) | Plan (read-only) approval mode. `--effort` has no effect |
 | `api` | Anthropic API | Never picked automatically. Needs `ANTHROPIC_API_KEY`. No `--explore`, `--agentic-fix` or `--budget` |
@@ -220,7 +221,7 @@ What's different from `claude-code`:
 - **Models.** Without `--model`, each harness uses its own default model, and every agent uses it: the Sonnet default for the readability reviewer only applies to `claude-code` and `api`. `--fast` only lowers the effort to medium.
 - **Replies are checked.** Except with Codex, the harness can't enforce the JSON shape, so the prompt asks for it, and the reply is checked here. A reply that doesn't fit counts as that agent failing, like any other error.
 - **Reviewers can read the repo.** Codex, Gemini and Copilot always have their read-only file tools, so reviewers behave as if `--explore` were on. They can't edit files or run commands that change anything. With `command`, what the agent can do is up to the command, and `--explore` is ignored.
-- **No agentic fixer or budget.** `--agentic-fix` needs Claude Code's permission rules to limit the agent to your `--check` commands, and `--budget` needs a cost figure, which only Claude Code reports. Token counts still appear in the report where the harness reports them.
+- **Agentic fixer and budget on Claude Code and Copilot only.** `--agentic-fix` needs permission rules that can limit the agent to your `--check` commands and keep it out of gitignored files, and `--budget` needs a cost figure. Codex, Gemini and custom commands provide neither. Token counts still appear in the report where the harness reports them.
 - **Project files.** Codex is run with `AGENTS.md` loading turned off, and Copilot with `--no-custom-instructions`, so a change can't rewrite its own instructions. Your conventions in those files still apply, because reviewloop passes them as [project rules](#project-rules), read from `--base`. Gemini CLI still loads `GEMINI.md` and project `.gemini/` settings from the repo, and a `command` agent loads whatever it loads, so with those, a change under review can affect its own review.
 
 ## Custom reviewers

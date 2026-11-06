@@ -10,7 +10,7 @@ from typing import Callable, Protocol
 
 from . import context, suppressions
 from .edits import EditResult, apply_edits, unified_diff
-from .llm import LLMError, Usage
+from .llm import AgentScope, LLMError, Usage
 from .schemas import CHECK_FIXER_SCHEMA, FIXER_SCHEMA, OVERSEER_SCHEMA, REVIEW_SCHEMA, SEVERITIES, Finding
 from .suppressions import Suppression
 
@@ -42,7 +42,7 @@ class LLM(Protocol):
 
     def structured(self, system: str, user: str, schema: dict, tools: list[str] | None = None) -> dict: ...
 
-    def agent(self, system: str, user: str, schema: dict, allowed: list[str], denied: list[str]) -> dict: ...
+    def agent(self, system: str, user: str, schema: dict, scope: AgentScope) -> dict: ...
 
 
 @dataclass(frozen=True)
@@ -84,7 +84,7 @@ class Config:
     out_dir: Path | None = None
     explore: bool = False  # give reviewers read-only repo tools (claude-code backend)
     triage: bool = False  # the user decides on each finding; the overseer doesn't run
-    agentic_fix: bool = False  # let an agent run the checks and edit files itself (claude-code backend)
+    agentic_fix: bool = False  # let an agent run the checks and edit files itself (claude-code or copilot backend)
     budget: float | None = None  # stop once the reported cost reaches this many US dollars
 
 
@@ -192,7 +192,11 @@ class ReviewLoop:
         return Outcome("not_converged", rounds, self.findings)
 
     def _over_budget(self) -> bool:
-        spent, budget = self.llm.usage.cost_usd, self.cfg.budget
+        usage, budget = self.llm.usage, self.cfg.budget
+        spent = usage.cost_usd
+        if budget is not None and usage.uncosted_calls:
+            self.log(f"Budget can't be checked: {usage.uncosted_calls} call(s) didn't report a cost. Stopping.")
+            return True
         if budget is None or spent < budget:
             return False
         self.log(f"Budget reached: ${spent:.4f} spent of ${budget:.4f}. Stopping.")
@@ -566,25 +570,20 @@ class ReviewLoop:
 
     # ---- check fixer -----------------------------------------------------
 
-    def _check_fixer_permissions(self) -> tuple[list[str], list[str]] | None:
-        """Allow edits inside the repo and the exact check commands; deny what must stay private or intact."""
+    def _check_fixer_scope(self) -> AgentScope | None:
+        """Edits inside the repo and the exact check commands; gitignored files stay private."""
         cfg = self.cfg
-        commands = context.scopable_checks(cfg.checks)
         ignored = context.ignored_paths(cfg.repo)
         if len(ignored) > context.MAX_DENY_RULES:
             self.log(f"  check fixer: skipped; {len(ignored):,} ignored paths is too many to keep it away from")
             return None
-        paths = [f"./{p}**" if p.endswith("/") else f"./{p}" for p in ignored]
-        denied = ["Read(./.env*)", "Edit(./.env*)", "Edit(./.git/**)", "Edit(./.reviewloop/**)"]
-        denied += [f"{tool}({path})" for path in paths for tool in ("Read", "Edit")]
-        allowed = ["Read(./**)", "Grep(./**)", "Glob(./**)", "Edit(./**)", *(f"Bash({c})" for c in commands)]
-        return allowed, denied
+        return AgentScope(repo=cfg.repo, commands=context.scopable_checks(cfg.checks), private=ignored)
 
     def _fix_checks(self, files: list[str], checks: list[context.CheckResult], rules: dict[str, str], rl: RoundLog) -> str:
         """Let the agent run the checks and edit until they pass. Returns a diff of what it changed."""
         cfg = self.cfg
-        permissions = self._check_fixer_permissions()
-        if permissions is None:
+        scope = self._check_fixer_scope()
+        if scope is None:
             return ""
         failing = [c for c in checks if not c.passed]
         now = context.gather(cfg.repo, cfg.base, files, failing, rules)
@@ -598,7 +597,7 @@ class ReviewLoop:
         self.log(f"  check fixer: working on {len(failing)} failing check(s)...")
         start = time.monotonic()
         try:
-            notes = self.llm.agent(system, prompt, CHECK_FIXER_SCHEMA, *permissions)["notes"]
+            notes = self.llm.agent(system, prompt, CHECK_FIXER_SCHEMA, scope)["notes"]
         except LLMError as e:  # it may have edited files before failing, so still record those
             notes = f"check fixer failed: {e}"
             self.log(f"  check fixer: ERROR {e}")
