@@ -8,13 +8,15 @@ import time
 from pathlib import Path
 
 from . import context, report
-from .llm import DEFAULT_MODEL, ApiLLM, ClaudeCodeLLM, LLMError, Usage
+from .llm import DEFAULT_MODEL, ApiLLM, ClaudeCodeLLM, CodexLLM, CommandLLM, CopilotLLM, GeminiLLM, LLMError, Usage
 from .loop import Config, ReviewLoop, load_reviewers
 from .schemas import SEVERITIES
 
 FAST_MODEL = "claude-sonnet-5-5"
 EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 DEFAULT_REVIEWER_MODELS = {"readability": (FAST_MODEL, "medium")}  # style rarely needs the top model at high effort
+CLAUDE_BACKENDS = {"claude-code", "api"}  # where the Claude model defaults apply
+BACKENDS = ["claude-code", "api", "codex", "gemini", "copilot", "command"]
 EXIT = {"approved": 0, "nothing_to_review": 0, "report_only": 0, "not_converged": 1, "triage_aborted": 1, "over_budget": 1}
 
 
@@ -42,11 +44,18 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="mark each finding fix, skip or false positive yourself, instead of running the overseer")
     p.add_argument("--reviewers", help="comma-separated subset of reviewers to run (default: all)")
     p.add_argument("--reviewer-dir", type=Path, help="directory of extra reviewer prompts (<name>.md)")
-    p.add_argument("--backend", choices=["claude-code", "api"], default="claude-code",
-                   help="claude-code: run `claude -p` on your Claude Code login (default); api: Anthropic API, needs ANTHROPIC_API_KEY")
+    p.add_argument("--backend", choices=BACKENDS, default="claude-code",
+                   help="claude-code: run `claude -p` on your Claude Code login (default); api: Anthropic API, needs "
+                        "ANTHROPIC_API_KEY; codex: OpenAI Codex CLI (`codex exec`); gemini: Gemini CLI (`gemini -p`); "
+                        "copilot: GitHub Copilot CLI (`copilot -p`); "
+                        "command: any command given with --agent-cmd")
+    p.add_argument("--agent-cmd", metavar="CMD",
+                   help="with --backend command: the command to run for each agent call. It gets the prompt on stdin "
+                        "and must print a JSON object. {model} and {effort} are replaced, e.g. 'opencode run -m {model}'")
     p.add_argument("--explore", action="store_true",
                    help="let reviewers read/grep the rest of the repo for context (claude-code backend only; slower)")
-    p.add_argument("--model", help=f"Claude model (default: {DEFAULT_MODEL}, or {FAST_MODEL} with --fast)")
+    p.add_argument("--model", help=f"model (default: {DEFAULT_MODEL}, or {FAST_MODEL} with --fast; "
+                                   "with other backends, the harness's own default)")
     p.add_argument("--effort", choices=EFFORTS,
                    help="reasoning effort (default: high, or medium with --fast)")
     p.add_argument("--fast", action="store_true",
@@ -61,7 +70,7 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 def reviewer_models(args: argparse.Namespace, names: set[str], effort: str) -> dict[str, tuple[str, str]]:
     """Which reviewers don't use the run's model: {name: (model, effort)}."""
-    use_defaults = not (args.model or args.effort or args.fast)
+    use_defaults = args.backend in CLAUDE_BACKENDS and not (args.model or args.effort or args.fast)
     chosen = {n: m for n, m in DEFAULT_REVIEWER_MODELS.items() if n in names} if use_defaults else {}
     for spec in args.reviewer_model:
         name, _, value = spec.partition("=")
@@ -90,7 +99,8 @@ def main(argv=None) -> int:
         return 2
 
     if args.agentic_fix:
-        problem = ("--agentic-fix needs --backend claude-code" if args.backend != "claude-code"
+        problem = ("--agentic-fix needs --backend claude-code, the only harness whose tools can be limited to your "
+                   "--check commands" if args.backend != "claude-code"
                    else "--agentic-fix can't be combined with --no-fix, because no fixer runs" if args.no_fix
                    else "--agentic-fix needs at least one --check" if not args.check
                    else None)
@@ -107,11 +117,18 @@ def main(argv=None) -> int:
 
     if args.budget is not None:
         problem = ("--budget must be a positive number of dollars" if not (math.isfinite(args.budget) and args.budget > 0)
-                   else "--budget needs --backend claude-code, because the api backend doesn't report a cost" if args.backend != "claude-code"
+                   else f"--budget needs --backend claude-code, because the {args.backend} backend doesn't report a cost"
+                   if args.backend != "claude-code"
                    else None)
         if problem:
             print(f"error: {problem}", file=sys.stderr)
             return 2
+
+    if (args.agent_cmd is not None) != (args.backend == "command"):
+        message = ("--backend command needs --agent-cmd" if args.backend == "command"
+                   else "--agent-cmd only works with --backend command")
+        print(f"error: {message}", file=sys.stderr)
+        return 2
 
     if args.triage:
         problem = ("--triage can't be combined with --no-fix, because no fixer runs" if args.no_fix
@@ -128,7 +145,8 @@ def main(argv=None) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
-    model = args.model or (FAST_MODEL if args.fast else DEFAULT_MODEL)
+    # Other harnesses don't run Claude by default, so they keep their own default model.
+    model = args.model or ((FAST_MODEL if args.fast else DEFAULT_MODEL) if args.backend in CLAUDE_BACKENDS else None)
     effort = args.effort or ("medium" if args.fast else "high")
     try:
         per_reviewer = reviewer_models(args, {r.name for r in reviewers}, effort)
@@ -151,9 +169,22 @@ def main(argv=None) -> int:
                  agentic_fix=args.agentic_fix, budget=args.budget)
     usage = Usage()  # shared, so the report and --budget total every model
 
-    def make_llm(model: str, effort: str):
-        return (ClaudeCodeLLM(model=model, effort=effort, cwd=repo, usage=usage) if args.backend == "claude-code"
-                else ApiLLM(model=model, effort=effort, usage=usage))
+    def make_llm(model: str | None, effort: str):
+        match args.backend:
+            case "claude-code":
+                return ClaudeCodeLLM(model=model, effort=effort, cwd=repo, usage=usage)
+            case "api":
+                return ApiLLM(model=model, effort=effort, usage=usage)
+            case "codex":
+                return CodexLLM(model=model, effort=effort, cwd=repo, usage=usage)
+            case "gemini":
+                return GeminiLLM(model=model, effort=effort, cwd=repo, usage=usage)
+            case "copilot":
+                # Only an effort you chose: Copilot's default `auto` model rejects any effort.
+                chosen = args.effort or ("medium" if args.fast else None)
+                return CopilotLLM(model=model, effort=effort if chosen else None, cwd=repo, usage=usage)
+            case _:
+                return CommandLLM(model=model, effort=effort, cwd=repo, usage=usage, command=args.agent_cmd)
 
     try:
         llm = make_llm(model, effort)
@@ -161,9 +192,12 @@ def main(argv=None) -> int:
     except LLMError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
-    if args.explore and args.backend != "claude-code":
-        print("warning: --explore only works with --backend claude-code; ignoring", file=sys.stderr)
-    print(f"Model: {model} (effort {effort}) via {args.backend}")
+    if args.explore and args.backend in ("api", "command"):
+        print(f"warning: --explore doesn't work with --backend {args.backend}; ignoring", file=sys.stderr)
+    elif args.backend in ("codex", "gemini", "copilot") and not args.explore:
+        print(f"note: {args.backend} agents can always read the repo (read-only), as if --explore were on", file=sys.stderr)
+    effort_shown = f" (effort {effort})" if getattr(llm, "effort", effort) else ""
+    print(f"Model: {model or 'harness default'}{effort_shown} via {args.backend}")
     for name, (reviewer_model, reviewer_effort) in sorted(per_reviewer.items()):
         print(f"  {name} reviewer: {reviewer_model} (effort {reviewer_effort})")
     try:

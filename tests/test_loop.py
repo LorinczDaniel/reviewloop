@@ -1716,3 +1716,200 @@ def test_agent_does_not_start_once_the_budget_is_reached(repo):
     outcome = run(repo, llm, checks=[flag_check(repo)], agentic_fix=True, budget=2.0)
     assert outcome.status == "over_budget"
     assert llm.agent_calls == []
+
+
+# ---- other harnesses -------------------------------------------------------
+
+REVIEW_REPLY = {"summary": "ok", "previous": [], "findings": [{
+    "severity": "minor", "file": "app.py", "line": 2, "quote": "q", "title": "t", "detail": "d", "suggestion": "s"}]}
+
+
+@pytest.mark.parametrize("text", [
+    json.dumps(REVIEW_REPLY),
+    "Here you go:\n```json\n" + json.dumps(REVIEW_REPLY, indent=2) + "\n```\n",
+    'Draft: {"summary": "no"} then the final answer ' + json.dumps(REVIEW_REPLY),
+])
+def test_json_is_found_in_a_wrapped_reply(text):
+    assert llm_module.validate(llm_module.extract_json(text), REVIEW_SCHEMA) == REVIEW_REPLY
+
+
+def test_reply_without_json_is_an_error():
+    with pytest.raises(llm_module.LLMError, match="no JSON object"):
+        llm_module.extract_json("I couldn't do that.")
+
+
+@pytest.mark.parametrize("change, message", [
+    (lambda r: r.pop("previous"), "missing previous"),
+    (lambda r: r["findings"][0].update(severity="huge"), "not one of"),
+    (lambda r: r["findings"][0].update(line="2"), "expected an integer"),
+    (lambda r: r.update(findings={}), "expected an array"),
+])
+def test_reply_that_does_not_fit_the_schema_is_an_error(change, message):
+    reply = json.loads(json.dumps(REVIEW_REPLY))
+    change(reply)
+    with pytest.raises(llm_module.LLMError, match=message):
+        llm_module.validate(reply, REVIEW_SCHEMA)
+
+
+def test_validate_drops_unknown_keys_and_accepts_integral_floats():
+    reply = json.loads(json.dumps(REVIEW_REPLY))
+    reply["extra"] = 1
+    reply["findings"][0]["line"] = 2.0
+    assert llm_module.validate(reply, REVIEW_SCHEMA) == REVIEW_REPLY
+
+
+def _fake_harness(monkeypatch, respond):
+    """Patch subprocess.run; `respond(cmd, stdin)` returns (stdout, returncode)."""
+    calls = []
+
+    def fake_run(cmd, input=None, **kw):
+        calls.append({"cmd": cmd, "stdin": input, **kw})
+        stdout, code = respond(cmd, input)
+        return subprocess.CompletedProcess(cmd, code, stdout=stdout, stderr="boom")
+
+    monkeypatch.setattr(llm_module.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(llm_module.subprocess, "run", fake_run)
+    return calls
+
+
+def test_codex_backend_runs_read_only_with_the_schema_and_counts_tokens(monkeypatch, tmp_path):
+    def respond(cmd, stdin):
+        schema = json.loads(Path(cmd[cmd.index("--output-schema") + 1]).read_text())
+        assert schema == REVIEW_SCHEMA
+        Path(cmd[cmd.index("--output-last-message") + 1]).write_text(json.dumps(REVIEW_REPLY))
+        events = [{"type": "thread.started"},
+                  {"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 3}}]
+        return "\n".join(map(json.dumps, events)), 0
+
+    calls = _fake_harness(monkeypatch, respond)
+    codex = llm_module.CodexLLM(effort="max", cwd=tmp_path)
+    assert codex.structured("SYSTEM", "USER", REVIEW_SCHEMA) == REVIEW_REPLY
+    cmd = calls[0]["cmd"]
+    assert cmd[:2] == ["codex", "exec"] and cmd[-1] == "-"
+    assert cmd[cmd.index("--sandbox") + 1] == "read-only"
+    assert "model_reasoning_effort=xhigh" in cmd and "project_doc_max_bytes=0" in cmd
+    assert "--model" not in cmd  # codex's own default
+    assert "SYSTEM" in calls[0]["stdin"] and "USER" in calls[0]["stdin"]
+    assert calls[0]["cwd"] == tmp_path
+    assert (codex.usage.input_tokens, codex.usage.output_tokens, codex.usage.calls) == (10, 3, 1)
+
+
+def test_codex_error_event_is_reported(monkeypatch):
+    _fake_harness(monkeypatch, lambda cmd, _: (json.dumps({"type": "turn.failed", "error": {"message": "quota"}}), 1))
+    with pytest.raises(llm_module.LLMError, match="quota"):
+        llm_module.CodexLLM(model="gpt-x").structured("s", "u", REVIEW_SCHEMA)
+
+
+def test_gemini_backend_parses_the_response_and_stats(monkeypatch):
+    output = {"response": "```json\n" + json.dumps(REVIEW_REPLY) + "\n```",
+              "stats": {"models": {"gemini-x": {"tokens": {"prompt": 7, "candidates": 2, "thoughts": 1}}}}}
+    calls = _fake_harness(monkeypatch, lambda cmd, _: (json.dumps(output), 0))
+    gemini = llm_module.GeminiLLM(model="gemini-x")
+    assert gemini.structured("s", "u", REVIEW_SCHEMA) == REVIEW_REPLY
+    cmd = calls[0]["cmd"]
+    assert cmd[cmd.index("--approval-mode") + 1] == "plan"
+    assert cmd[cmd.index("--model") + 1] == "gemini-x"
+    assert (gemini.usage.input_tokens, gemini.usage.output_tokens) == (7, 3)
+
+
+def test_gemini_error_is_reported(monkeypatch):
+    _fake_harness(monkeypatch, lambda cmd, _: (json.dumps({"error": {"message": "no auth"}}), 1))
+    with pytest.raises(llm_module.LLMError, match="no auth"):
+        llm_module.GeminiLLM().structured("s", "u", REVIEW_SCHEMA)
+
+
+def test_command_backend_fills_placeholders_and_reads_stdout(monkeypatch):
+    calls = _fake_harness(monkeypatch, lambda cmd, _: ("thinking...\n" + json.dumps(REVIEW_REPLY), 0))
+    agent = llm_module.CommandLLM(model="m1", effort="low", command="my-agent --model {model} --effort={effort} 'a b'")
+    assert agent.structured("s", "u", REVIEW_SCHEMA) == REVIEW_REPLY
+    assert calls[0]["cmd"] == ["my-agent", "--model", "m1", "--effort=low", "a b"]
+    assert "single JSON object" in calls[0]["stdin"]
+
+
+def test_command_backend_without_model_placeholder_rejects_a_model(monkeypatch):
+    _fake_harness(monkeypatch, lambda cmd, _: ("", 0))
+    with pytest.raises(llm_module.LLMError, match="placeholder"):
+        llm_module.CommandLLM(model="m1", command="my-agent")
+
+
+def test_command_backend_failure_is_an_error(monkeypatch):
+    _fake_harness(monkeypatch, lambda cmd, _: ("", 3))
+    with pytest.raises(llm_module.LLMError, match="exit 3"):
+        llm_module.CommandLLM(command="my-agent").structured("s", "u", REVIEW_SCHEMA)
+
+
+def test_copilot_backend_reads_stdin_allows_only_reading_and_counts_tokens(monkeypatch):
+    def respond(cmd, stdin):
+        usage = {"tokenDetails": {"input": {"tokenCount": 5}, "cache_read": {"tokenCount": 2}, "output": {"tokenCount": 1}}}
+        Path(cmd[cmd.index("--usage-output-file") + 1]).write_text(json.dumps(usage))
+        return "Here:\n```json\n" + json.dumps(REVIEW_REPLY) + "\n```", 0
+
+    calls = _fake_harness(monkeypatch, respond)
+    copilot = llm_module.CopilotLLM(model="gpt-x")
+    assert copilot.structured("SYSTEM", "USER", REVIEW_SCHEMA) == REVIEW_REPLY
+    cmd = calls[0]["cmd"]
+    assert "SYSTEM" in calls[0]["stdin"] and "--prompt" not in cmd and "-p" not in cmd
+    assert {"--silent", "--no-ask-user", "--no-custom-instructions",
+            "--available-tools=view,grep,glob", "--allow-tool=read"} <= set(cmd)
+    assert not any("allow-all" in a for a in cmd)
+    assert cmd[cmd.index("--model") + 1] == "gpt-x"
+    assert "--reasoning-effort" not in cmd  # the default `auto` model rejects one
+    assert (copilot.usage.input_tokens, copilot.usage.output_tokens) == (7, 1)
+
+
+def test_copilot_backend_passes_a_chosen_effort(monkeypatch):
+    calls = _fake_harness(monkeypatch, lambda cmd, _: (json.dumps(REVIEW_REPLY), 0))
+    llm_module.CopilotLLM(effort="low").structured("s", "u", REVIEW_SCHEMA)
+    assert calls[0]["cmd"][calls[0]["cmd"].index("--reasoning-effort") + 1] == "low"
+
+
+@pytest.mark.parametrize("flags, effort", [([], None), (["--effort", "max"], "max"), (["--fast"], "medium")])
+def test_cli_gives_copilot_an_effort_only_when_chosen(repo, monkeypatch, flags, effort):
+    made = []
+
+    class Recording(FakeLLM):
+        def __init__(self, **kw):
+            super().__init__()
+            made.append(kw)
+            self.usage = kw["usage"]
+
+    monkeypatch.setattr(cli, "CopilotLLM", Recording)
+    assert cli.main(["--repo", str(repo), "-y", "--backend", "copilot", *flags]) == 0
+    assert made[0]["effort"] == effort
+
+
+@pytest.mark.parametrize("cls", [llm_module.CodexLLM, llm_module.GeminiLLM, llm_module.CopilotLLM])
+def test_other_harnesses_refuse_the_agentic_fixer(monkeypatch, cls):
+    _fake_harness(monkeypatch, lambda cmd, _: ("", 0))
+    with pytest.raises(llm_module.LLMError, match="claude-code"):
+        cls().agent("s", "u", {}, [], [])
+
+
+@pytest.mark.parametrize("backend", ["codex", "gemini", "copilot", "command"])
+def test_cli_other_harness_uses_its_own_default_model_everywhere(repo, monkeypatch, backend):
+    made = []
+
+    class Recording(FakeLLM):
+        def __init__(self, **kw):
+            super().__init__()
+            made.append(kw)
+            self.usage = kw["usage"]
+
+    monkeypatch.setattr(cli, {"codex": "CodexLLM", "gemini": "GeminiLLM", "copilot": "CopilotLLM", "command": "CommandLLM"}[backend], Recording)
+    extra = ["--agent-cmd", "my-agent"] if backend == "command" else []
+    assert cli.main(["--repo", str(repo), "-y", "--backend", backend, *extra]) == 0
+    assert [kw["model"] for kw in made] == [None]  # no Sonnet split for readability either
+    if backend == "command":
+        assert made[0]["command"] == "my-agent"
+
+
+@pytest.mark.parametrize("flags, message", [
+    (["--backend", "command"], "needs --agent-cmd"),
+    (["--agent-cmd", "x"], "only works with --backend command"),
+    (["--backend", "codex", "--budget", "1"], "codex backend doesn't report a cost"),
+    (["--backend", "gemini", "--agentic-fix", "--check", "true"], "needs --backend claude-code"),
+])
+def test_cli_rejects_harness_flag_combinations(repo, monkeypatch, capsys, flags, message):
+    monkeypatch.setattr(cli, "ClaudeCodeLLM", lambda **_: pytest.fail("no model call expected"))
+    assert cli.main(["--repo", str(repo), "-y", *flags]) == 2
+    assert message in capsys.readouterr().err

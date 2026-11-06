@@ -1,7 +1,7 @@
 [project]
 name = "reviewloop"
 version = "0.1.0"
-description = "Multi-reviewer code review loop powered by Claude"
+description = "Multi-reviewer code review loop powered by Claude or other coding agents"
 readme = "README.md"
 authors = [
     { name = "Daniel Lorincz" }

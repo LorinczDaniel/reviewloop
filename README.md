@@ -1,6 +1,6 @@
 # reviewloop
 
-Multi-reviewer code review loop powered by Claude. Specialist reviewers (safety, security, readability, tests) review your diff in parallel. An overseer decides what to do with each finding, and a fixer applies the changes. The loop repeats until no blocking findings remain and your checks pass, or until it hits the round limit and hands off to you.
+Multi-reviewer code review loop powered by Claude, or by another coding agent such as Codex, Gemini CLI or GitHub Copilot CLI. Specialist reviewers (safety, security, readability, tests) review your diff in parallel. An overseer decides what to do with each finding, and a fixer applies the changes. The loop repeats until no blocking findings remain and your checks pass, or until it hits the round limit and hands off to you.
 
 ```
 round N:  safety ─┐
@@ -16,7 +16,7 @@ round N:  safety ─┐
 
 - Python 3.12+ and [uv](https://docs.astral.sh/uv/getting-started/installation/)
 - git (it reviews the diff of a git repository)
-- [Claude Code](https://code.claude.com), installed and logged in (`claude` on your PATH). Alternatively, an Anthropic API key with `--backend api`.
+- [Claude Code](https://code.claude.com), installed and logged in (`claude` on your PATH). Alternatively, an Anthropic API key with `--backend api`, or another agent harness; see [Other harnesses](#other-harnesses).
 
 ## Install
 
@@ -77,12 +77,13 @@ By default each agent is a headless `claude -p` call on your Claude Code login, 
 | `--max-rounds N` | `4` | Stop and hand back to you after N rounds |
 | `--block LIST` | `blocker,major` | Severities that block approval |
 | `--fast` | off | Claude Sonnet 5.5 at medium effort instead of Claude Opus 5.5 at high. Quicker; use the default for security-sensitive code |
-| `--model`, `--effort` | `claude-opus-5-5`, `high` | Choose the model and effort directly. Either one also turns off the default Sonnet for readability |
+| `--model`, `--effort` | `claude-opus-5-5`, `high` | Choose the model and effort directly. Either one also turns off the default Sonnet for readability. With another harness, the model defaults to that harness's own |
 | `--reviewer-model NAME=MODEL[:EFFORT]` | `readability=claude-sonnet-5-5:medium` | Choose one reviewer's model, e.g. `security=claude-opus-5-5:max`. Repeatable; without an effort it uses the run's |
 | `--explore` | off | Reviewers can read and grep the whole repo, not just the diff. Slower, but catches issues in surrounding code |
 | `--reviewers LIST` | all | Run only some reviewers, e.g. `safety,security` |
 | `--reviewer-dir DIR` | none | Add your own reviewers (see below) |
-| `--backend` | `claude-code` | `claude-code` or `api` |
+| `--backend` | `claude-code` | `claude-code`, `api`, `codex`, `gemini`, `copilot` or `command`. See [Other harnesses](#other-harnesses) |
+| `--agent-cmd CMD` | none | With `--backend command`: the command to run for each agent call |
 | `--repo PATH` | current directory | Repository to review |
 | `--out DIR` | `<repo>/.reviewloop` | Where reports and backups go |
 | `-y`, `--yes` | off | Don't ask before the fixer edits files |
@@ -183,6 +184,41 @@ It uses one more model call per round. To leave it out, list the others: `--revi
 By default, every agent uses Claude Opus 5.5 at high effort except the readability reviewer, which uses Claude Sonnet 5.5 at medium, because style findings rarely need the top model. The log shows any reviewer that isn't on the main model.
 
 `--reviewer-model` always wins. Otherwise, passing `--model`, `--effort` or `--fast` means you've chosen for the whole run, so readability uses that choice too. To keep Opus on readability, pass `--reviewer-model readability=claude-opus-5-5:high`. The overseer and fixer always use the main model.
+
+## Other harnesses
+
+Every agent call is one prompt in and one JSON object out, so reviewloop can run on coding agents other than Claude Code. Pick one with `--backend`:
+
+| Backend | Runs | Notes |
+|---|---|---|
+| `claude-code` (default) | `claude -p` | Everything works, including `--agentic-fix` and `--budget` |
+| `api` | Anthropic API | Needs `ANTHROPIC_API_KEY`. No `--explore`, `--agentic-fix` or `--budget` |
+| `codex` | `codex exec` ([OpenAI Codex CLI](https://github.com/openai/codex)) | Read-only sandbox. Replies are constrained with `--output-schema`. `--effort max` becomes `xhigh` |
+| `gemini` | `gemini -p` ([Gemini CLI](https://github.com/google-gemini/gemini-cli)) | Plan (read-only) approval mode. `--effort` has no effect |
+| `copilot` | `copilot` ([GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/use-copilot-cli)), prompt on stdin | Only its read-only tools (`view`, `grep`, `glob`). `AGENTS.md` and other custom instructions aren't loaded. `--effort` is only passed when you set it (or `--fast`), because Copilot's default `auto` model rejects any effort |
+| `command` | whatever `--agent-cmd` says | See below |
+
+Install and log in to the harness first; reviewloop uses its login, and its own config, the same way it uses Claude Code's.
+
+```bash
+reviewloop --backend codex --check "pytest -q"
+reviewloop --backend gemini --no-fix
+```
+
+**Generic command.** `--backend command --agent-cmd CMD` works with any tool that can answer a prompt from stdin. For each call, reviewloop runs `CMD` in the repo (split like a shell would, but not run through a shell), writes the prompt to its stdin, and reads a JSON object from its stdout. Text around the object, such as a code fence or a preamble, is ignored. `{model}` and `{effort}` in the command are replaced with the chosen model and effort, so `--model` and `--reviewer-model` work only if the command uses `{model}`:
+
+```bash
+reviewloop --backend command --agent-cmd "opencode run -m {model}" --model anthropic/claude-sonnet-5-5
+reviewloop --backend command --agent-cmd "./my-agent.sh"
+```
+
+What's different from `claude-code`:
+
+- **Models.** Without `--model`, each harness uses its own default model, and every agent uses it: the Sonnet default for the readability reviewer only applies to `claude-code` and `api`. `--fast` only lowers the effort to medium.
+- **Replies are checked.** Except with Codex, the harness can't enforce the JSON shape, so the prompt asks for it, and the reply is checked here. A reply that doesn't fit counts as that agent failing, like any other error.
+- **Reviewers can read the repo.** Codex, Gemini and Copilot always have their read-only file tools, so reviewers behave as if `--explore` were on. They can't edit files or run commands that change anything. With `command`, what the agent can do is up to the command, and `--explore` is ignored.
+- **No agentic fixer or budget.** `--agentic-fix` needs Claude Code's permission rules to limit the agent to your `--check` commands, and `--budget` needs a cost figure, which only Claude Code reports. Token counts still appear in the report where the harness reports them.
+- **Project files.** Codex is run with `AGENTS.md` loading turned off, so a change can't rewrite its own instructions. Copilot is run with `--no-custom-instructions` for the same reason. Gemini CLI still loads `GEMINI.md` and project `.gemini/` settings from the repo, and a `command` agent loads whatever it loads, so with those, a change under review can affect its own review.
 
 ## Custom reviewers
 
