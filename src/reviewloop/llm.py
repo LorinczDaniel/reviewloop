@@ -9,8 +9,8 @@ Interchangeable backends with the same `structured()` method:
 - CommandLLM runs any command you give it: the prompt goes in on stdin,
   and a JSON object is expected back on stdout.
 
-Only ClaudeCodeLLM can run the agentic check fixer, because it's the only
-harness whose tool permissions can be limited to exact commands.
+ClaudeCodeLLM and CopilotLLM can also run the agentic check fixer, because
+their tool permissions can be limited to the repo and the exact check commands.
 """
 
 import json
@@ -18,6 +18,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,12 +38,30 @@ class Usage:
     output_tokens: int = 0
     calls: int = 0
     cost_usd: float = 0.0
+    uncosted_calls: int = 0  # calls whose harness reports costs but didn't for this one
 
-    def add(self, input_tokens: int, output_tokens: int, cost_usd: float = 0.0) -> None:
+    def add(self, input_tokens: int, output_tokens: int, cost_usd: float | None = 0.0) -> None:
         self.input_tokens += input_tokens
         self.output_tokens += output_tokens
-        self.cost_usd += cost_usd
+        if cost_usd is None:
+            self.uncosted_calls += 1
+        else:
+            self.cost_usd += cost_usd
         self.calls += 1
+
+
+@dataclass
+class AgentScope:
+    """What the agentic check fixer may do, for each backend to turn into its own permission rules.
+
+    It can read and edit inside `repo` and run exactly `commands`. It can't read or
+    edit `private` paths (repo-relative; a trailing slash means a whole directory)
+    or .env* files, and it can't edit .git or .reviewloop.
+    """
+
+    repo: Path
+    commands: list[str]
+    private: list[str]
 
 
 @dataclass
@@ -64,16 +83,26 @@ class ClaudeCodeLLM:
         """
         return self._run(system, user, schema, tools or [])
 
-    def agent(self, system: str, user: str, schema: dict, allowed: list[str], denied: list[str]) -> dict:
-        """Run a session that can use tools, limited to the `allowed` permission rules.
+    def agent(self, system: str, user: str, schema: dict, scope: AgentScope) -> dict:
+        """Run a session that can use tools, limited to `scope`.
 
         Anything else is refused rather than prompted for. Rules are passed one
         argument each, because a check command can contain spaces or commas.
         """
+        allowed, denied = self.permission_rules(scope)
         tools = ["Read", "Grep", "Glob", "Edit", "Write", "Bash"]
         return self._run(system, user, schema, tools, [
             "--permission-mode", "dontAsk", "--allowedTools", *allowed, "--disallowedTools", *denied,
         ], {**os.environ, "BASH_DEFAULT_TIMEOUT_MS": BASH_TIMEOUT_MS, "BASH_MAX_TIMEOUT_MS": BASH_TIMEOUT_MS})
+
+    @staticmethod
+    def permission_rules(scope: AgentScope) -> tuple[list[str], list[str]]:
+        """Claude Code allow and deny rules for `scope`, relative to the repo it runs in."""
+        paths = [f"./{p}**" if p.endswith("/") else f"./{p}" for p in scope.private]
+        denied = ["Read(./.env*)", "Edit(./.env*)", "Edit(./.git/**)", "Edit(./.reviewloop/**)"]
+        denied += [f"{tool}({path})" for path in paths for tool in ("Read", "Edit")]
+        allowed = ["Read(./**)", "Grep(./**)", "Glob(./**)", "Edit(./**)", *(f"Bash({c})" for c in scope.commands)]
+        return allowed, denied
 
     def _run(self, system: str, user: str, schema: dict, tools: list[str], flags: list[str] | None = None,
              env: dict[str, str] | None = None) -> dict:
@@ -253,8 +282,8 @@ class _HarnessLLM:
     usage: Usage = field(default_factory=Usage)
     name = "harness"
 
-    def agent(self, system: str, user: str, schema: dict, allowed: list[str], denied: list[str]) -> dict:
-        raise LLMError(f"the {self.name} backend can't run the agentic check fixer; use --backend claude-code")
+    def agent(self, system: str, user: str, schema: dict, scope: AgentScope) -> dict:
+        raise LLMError(f"the {self.name} backend can't run the agentic check fixer; use claude-code or copilot")
 
     def _exec(self, cmd: list[str], stdin: str) -> subprocess.CompletedProcess:
         try:
@@ -370,6 +399,15 @@ class GeminiLLM(_HarnessLLM):
         return validate(extract_json(result["response"]), schema)
 
 
+COPILOT_USD_PER_AI_CREDIT = 0.01
+CHECK_SERVER = "reviewloop"  # the MCP server name, so its tool is "reviewloop-run_check"
+
+
+def _glob_literal(path: str) -> str:
+    """Escape Copilot permission-glob characters, so a path matches only itself."""
+    return "".join(f"[{c}]" if c in "*?[" else c for c in path)
+
+
 @dataclass
 class CopilotLLM(_HarnessLLM):
     """`copilot` with the prompt on stdin and only its read-only tools; the JSON reply is checked here."""
@@ -383,6 +421,57 @@ class CopilotLLM(_HarnessLLM):
 
     def structured(self, system: str, user: str, schema: dict, tools: list[str] | None = None) -> dict:
         """`tools` is ignored: Copilot can always read the repo, but nothing else."""
+        return self._run(_harness_prompt(system, user, schema), schema, [
+            "--available-tools=view,grep,glob",
+            "--allow-tool=read",
+        ])
+
+    def agent(self, system: str, user: str, schema: dict, scope: AgentScope) -> dict:
+        """Run a session that can read and edit the repo and run the checks, limited to `scope`.
+
+        Copilot's shell rules allow any arguments, and it approves read-only shell commands
+        like `cat` by itself, which path rules don't cover. So the agent gets no shell: it
+        runs the checks through reviewloop's own MCP tool, which takes a check's number and
+        runs exactly that command.
+        """
+        with tempfile.TemporaryDirectory(prefix="reviewloop-checks-") as tmp:
+            config = Path(tmp) / "checks.json"
+            config.write_text(json.dumps({"repo": str(scope.repo), "commands": scope.commands}))
+            server = {"mcpServers": {CHECK_SERVER: {
+                "type": "local",
+                "command": sys.executable,
+                "args": ["-I", "-m", "reviewloop.check_server", str(config)],
+                "tools": ["*"],
+                "timeout": CLAUDE_CODE_TIMEOUT * 1000,  # test suites can be slow
+            }}}
+            runnable = "\n".join(f"  {i}: {c}" for i, c in enumerate(scope.commands, 1))
+            user += ("\n\nIn this environment there's no shell. Run those commands with the "
+                     f"{CHECK_SERVER}-run_check tool, by number:\n" + runnable)
+            flags = ["--additional-mcp-config", json.dumps(server), *self.permission_flags(scope)]
+            return self._run(_harness_prompt(system, user, schema), schema, flags)
+
+    @staticmethod
+    def permission_flags(scope: AgentScope) -> list[str]:
+        """Copilot tool and permission flags for `scope`. Paths are absolute, because relative
+        ones match by trailing components anywhere in the tree."""
+        repo = _glob_literal(str(scope.repo.resolve()))
+        private = [f"{repo}/{_glob_literal(p)}**" if p.endswith("/") else f"{repo}/{_glob_literal(p)}"
+                   for p in scope.private] + [f"{repo}/.env*"]
+        return [
+            # No shell or web. No grep either: its read rules are checked against the folder
+            # searched, not each file it matches, so it would reach gitignored files.
+            f"--available-tools=view,glob,edit,create,{CHECK_SERVER}-run_check",
+            "--disable-builtin-mcps",
+            "--disallow-temp-dir",  # the server's config lives there, among other things
+            f"--allow-tool={CHECK_SERVER}(run_check)",
+            f"--allow-tool=read({repo}/**)",
+            f"--allow-tool=write({repo}/**)",
+            *(f"--deny-tool={kind}({path})" for path in private for kind in ("read", "write")),
+            f"--deny-tool=write({repo}/.git/**)",
+            f"--deny-tool=write({repo}/.reviewloop/**)",
+        ]
+
+    def _run(self, prompt: str, schema: dict, flags: list[str]) -> dict:
         with tempfile.TemporaryDirectory(prefix="reviewloop-copilot-") as tmp:
             usage_file = Path(tmp) / "usage.json"
             cmd = [
@@ -392,14 +481,13 @@ class CopilotLLM(_HarnessLLM):
                 # AGENTS.md and similar files can be part of the change under review,
                 # so don't load them. Project rules arrive in the prompt instead.
                 "--no-custom-instructions",
-                "--available-tools=view,grep,glob",
-                "--allow-tool=read",
+                *flags,
                 "--usage-output-file", str(usage_file),
                 *(["--model", self.model] if self.model else []),
                 *(["--reasoning-effort", self.effort] if self.effort else []),
             ]
             # With no --prompt, copilot reads the prompt from stdin, which has no size limit.
-            proc = self._exec(cmd, _harness_prompt(system, user, schema))
+            proc = self._exec(cmd, prompt)
             self._add_usage(usage_file)
         if proc.returncode != 0:
             raise self._failed(proc)
@@ -407,11 +495,17 @@ class CopilotLLM(_HarnessLLM):
 
     def _add_usage(self, usage_file: Path) -> None:
         try:
-            details = json.loads(usage_file.read_text()).get("tokenDetails") or {}
-        except (OSError, ValueError, AttributeError):
-            details = {}
+            report = json.loads(usage_file.read_text())
+        except (OSError, ValueError):
+            report = {}
+        report = report if isinstance(report, dict) else {}
+        details = report.get("tokenDetails") or {}
         count = lambda kind: (details.get(kind) or {}).get("tokenCount", 0)  # noqa: E731
-        self.usage.add(count("input") + count("cache_read") + count("cache_write"), count("output"))
+        # Billed in AI credits, reported in billionths of one; 1 AI credit = $0.01.
+        # Older premium-request billing reports no credits, so the cost is unknown.
+        nano = report.get("totalNanoAiu")
+        cost = nano / 1e9 * COPILOT_USD_PER_AI_CREDIT if isinstance(nano, (int, float)) else None
+        self.usage.add(count("input") + count("cache_read") + count("cache_write"), count("output"), cost)
 
 
 @dataclass
