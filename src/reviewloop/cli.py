@@ -2,6 +2,8 @@
 
 import argparse
 import math
+import os
+import shutil
 import subprocess
 import sys
 import time
@@ -17,6 +19,9 @@ EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 DEFAULT_REVIEWER_MODELS = {"readability": (FAST_MODEL, "medium")}  # style rarely needs the top model at high effort
 CLAUDE_BACKENDS = {"claude-code", "api"}  # where the Claude model defaults apply
 BACKENDS = ["claude-code", "api", "codex", "gemini", "copilot", "command"]
+# Without --backend, the first of these that's installed is used.
+DETECTED = [("claude-code", "claude"), ("copilot", "copilot"), ("codex", "codex"), ("gemini", "gemini")]
+BACKEND_ENV = "REVIEWLOOP_BACKEND"
 EXIT = {"approved": 0, "nothing_to_review": 0, "report_only": 0, "not_converged": 1, "triage_aborted": 1, "over_budget": 1}
 
 
@@ -44,8 +49,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="mark each finding fix, skip or false positive yourself, instead of running the overseer")
     p.add_argument("--reviewers", help="comma-separated subset of reviewers to run (default: all)")
     p.add_argument("--reviewer-dir", type=Path, help="directory of extra reviewer prompts (<name>.md)")
-    p.add_argument("--backend", choices=BACKENDS, default="claude-code",
-                   help="claude-code: run `claude -p` on your Claude Code login (default); api: Anthropic API, needs "
+    p.add_argument("--backend", choices=BACKENDS,
+                   help=f"default: ${BACKEND_ENV}, else the first installed of claude, copilot, codex, gemini. "
+                        "claude-code: run `claude -p` on your Claude Code login; api: Anthropic API, needs "
                         "ANTHROPIC_API_KEY; codex: OpenAI Codex CLI (`codex exec`); gemini: Gemini CLI (`gemini -p`); "
                         "copilot: GitHub Copilot CLI (`copilot -p`); "
                         "command: any command given with --agent-cmd")
@@ -85,8 +91,36 @@ def reviewer_models(args: argparse.Namespace, names: set[str], effort: str) -> d
     return chosen
 
 
+def installed(command: str) -> bool:
+    return shutil.which(command) is not None
+
+
+def choose_backend(args: argparse.Namespace) -> str:
+    """--backend, else $REVIEWLOOP_BACKEND, else the first harness that's installed."""
+    if args.backend:
+        return args.backend
+    if os.environ.get(BACKEND_ENV):
+        chosen = os.environ[BACKEND_ENV].strip()
+        if chosen not in BACKENDS:
+            raise ValueError(f"${BACKEND_ENV} is {chosen!r}; it must be one of {', '.join(BACKENDS)}")
+        return chosen
+    for backend, command in DETECTED:
+        if installed(command):
+            if backend != DETECTED[0][0]:
+                print(f"Using --backend {backend}: it's the first installed of "
+                      f"{', '.join(c for _, c in DETECTED)}.", file=sys.stderr)
+            return backend
+    raise ValueError("no coding agent found: install Claude Code, GitHub Copilot CLI, Codex or Gemini CLI and log in, "
+                     "or pass --backend api with ANTHROPIC_API_KEY set")
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
+    try:
+        args.backend = choose_backend(args)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     try:
         repo = context.repo_root(args.repo)
     except subprocess.CalledProcessError:

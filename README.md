@@ -16,7 +16,7 @@ round N:  safety ─┐
 
 - Python 3.12+ and [uv](https://docs.astral.sh/uv/getting-started/installation/)
 - git (it reviews the diff of a git repository)
-- [Claude Code](https://code.claude.com), installed and logged in (`claude` on your PATH). Alternatively, an Anthropic API key with `--backend api`, or another agent harness; see [Other harnesses](#other-harnesses).
+- One coding agent, installed and logged in: [Claude Code](https://code.claude.com), [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/use-copilot-cli), [Codex CLI](https://github.com/openai/codex) or [Gemini CLI](https://github.com/google-gemini/gemini-cli). reviewloop finds whichever you have. Alternatively, an Anthropic API key with `--backend api`. See [Other harnesses](#other-harnesses).
 
 ## Install
 
@@ -62,7 +62,7 @@ Before the fixer edits anything, it asks for confirmation (skip that with `-y`).
 
 When it finishes, the report is in `<repo>/.reviewloop/report.md` (with `report.json` next to it). The `.reviewloop` folder ignores itself, so it never shows up in your git status.
 
-By default each agent is a headless `claude -p` call on your Claude Code login, so you don't need an API key. Usage counts against your Claude plan. To use the Anthropic API instead, pass `--backend api` and set `ANTHROPIC_API_KEY`.
+Each agent is a headless call to the coding agent you have installed, on its login, so you don't need an API key. Usage counts against that plan. If you have more than one, Claude Code is used first, then Copilot, Codex and Gemini; the log says which one was picked when it isn't Claude Code. To choose, pass `--backend` or set `REVIEWLOOP_BACKEND` once in your shell profile, e.g. `export REVIEWLOOP_BACKEND=copilot`. To use the Anthropic API, pass `--backend api` and set `ANTHROPIC_API_KEY`.
 
 ### Options
 
@@ -82,7 +82,7 @@ By default each agent is a headless `claude -p` call on your Claude Code login, 
 | `--explore` | off | Reviewers can read and grep the whole repo, not just the diff. Slower, but catches issues in surrounding code |
 | `--reviewers LIST` | all | Run only some reviewers, e.g. `safety,security` |
 | `--reviewer-dir DIR` | none | Add your own reviewers (see below) |
-| `--backend` | `claude-code` | `claude-code`, `api`, `codex`, `gemini`, `copilot` or `command`. See [Other harnesses](#other-harnesses) |
+| `--backend` | `$REVIEWLOOP_BACKEND`, else the first installed of `claude`, `copilot`, `codex`, `gemini` | `claude-code`, `api`, `copilot`, `codex`, `gemini` or `command`. See [Other harnesses](#other-harnesses) |
 | `--agent-cmd CMD` | none | With `--backend command`: the command to run for each agent call |
 | `--repo PATH` | current directory | Repository to review |
 | `--out DIR` | `<repo>/.reviewloop` | Where reports and backups go |
@@ -147,11 +147,14 @@ Every agent gets your project's conventions in its prompt, so reviewers don't ha
 
 1. `.reviewloop/rules.md`
 2. `CLAUDE.md`
-3. `CONTRIBUTING.md`
+3. `AGENTS.md`
+4. `.github/copilot-instructions.md`
+5. `GEMINI.md`
+6. `CONTRIBUTING.md`
 
-The log shows which files were loaded and why any were left out. Each file is capped at 20,000 bytes.
+They're used whichever backend you run, so a team that writes its conventions for Copilot or Codex gets them applied too. The log shows which files were loaded and why any were left out. Each file is capped at 20,000 bytes, and a file with the same text as one already loaded, such as an `AGENTS.md` copied from `CLAUDE.md`, is only included once.
 
-**A change can't rewrite its own rules.** Tracked files are read from `--base`, so with the default base, uncommitted edits to `CLAUDE.md` don't count until you commit them. A rule file added by the change under review isn't loaded at all. Symlinks aren't followed, and neither are `@` imports inside `CLAUDE.md`.
+**A change can't rewrite its own rules.** Tracked files are read from `--base`, so with the default base, uncommitted edits to `CLAUDE.md` or `AGENTS.md` don't count until you commit them. A rule file added by the change under review isn't loaded at all. Symlinks aren't followed, and neither are `@` imports inside `CLAUDE.md`.
 
 `.reviewloop/rules.md` is the place for rules meant only for reviewloop. `.reviewloop` ignores itself in git, so the file stays local to your clone and works without committing it. To share it, run `git add -f .reviewloop/rules.md`; it's then treated like any other tracked file.
 
@@ -187,22 +190,22 @@ By default, every agent uses Claude Opus 5.5 at high effort except the readabili
 
 ## Other harnesses
 
-Every agent call is one prompt in and one JSON object out, so reviewloop can run on coding agents other than Claude Code. Pick one with `--backend`:
+Every agent call is one prompt in and one JSON object out, so reviewloop can run on coding agents other than Claude Code. Without `--backend` or `REVIEWLOOP_BACKEND`, it uses the first one installed, in the order of this table:
 
 | Backend | Runs | Notes |
 |---|---|---|
-| `claude-code` (default) | `claude -p` | Everything works, including `--agentic-fix` and `--budget` |
-| `api` | Anthropic API | Needs `ANTHROPIC_API_KEY`. No `--explore`, `--agentic-fix` or `--budget` |
+| `claude-code` | `claude -p` | Everything works, including `--agentic-fix` and `--budget` |
+| `copilot` | `copilot` ([GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/use-copilot-cli)), prompt on stdin | Only its read-only tools (`view`, `grep`, `glob`). Its own loading of `AGENTS.md` and other custom instructions is off; reviewloop passes them as [project rules](#project-rules) instead. `--effort` is only passed when you set it (or `--fast`), because Copilot's default `auto` model rejects any effort |
 | `codex` | `codex exec` ([OpenAI Codex CLI](https://github.com/openai/codex)) | Read-only sandbox. Replies are constrained with `--output-schema`. `--effort max` becomes `xhigh` |
 | `gemini` | `gemini -p` ([Gemini CLI](https://github.com/google-gemini/gemini-cli)) | Plan (read-only) approval mode. `--effort` has no effect |
-| `copilot` | `copilot` ([GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/use-copilot-cli)), prompt on stdin | Only its read-only tools (`view`, `grep`, `glob`). `AGENTS.md` and other custom instructions aren't loaded. `--effort` is only passed when you set it (or `--fast`), because Copilot's default `auto` model rejects any effort |
-| `command` | whatever `--agent-cmd` says | See below |
+| `api` | Anthropic API | Never picked automatically. Needs `ANTHROPIC_API_KEY`. No `--explore`, `--agentic-fix` or `--budget` |
+| `command` | whatever `--agent-cmd` says | Never picked automatically. See below |
 
 Install and log in to the harness first; reviewloop uses its login, and its own config, the same way it uses Claude Code's.
 
 ```bash
-reviewloop --backend codex --check "pytest -q"
-reviewloop --backend gemini --no-fix
+reviewloop --check "pytest -q"            # whichever agent you have
+reviewloop --backend codex --no-fix      # pick one when you have several
 ```
 
 **Generic command.** `--backend command --agent-cmd CMD` works with any tool that can answer a prompt from stdin. For each call, reviewloop runs `CMD` in the repo (split like a shell would, but not run through a shell), writes the prompt to its stdin, and reads a JSON object from its stdout. Text around the object, such as a code fence or a preamble, is ignored. `{model}` and `{effort}` in the command are replaced with the chosen model and effort, so `--model` and `--reviewer-model` work only if the command uses `{model}`:
@@ -218,7 +221,7 @@ What's different from `claude-code`:
 - **Replies are checked.** Except with Codex, the harness can't enforce the JSON shape, so the prompt asks for it, and the reply is checked here. A reply that doesn't fit counts as that agent failing, like any other error.
 - **Reviewers can read the repo.** Codex, Gemini and Copilot always have their read-only file tools, so reviewers behave as if `--explore` were on. They can't edit files or run commands that change anything. With `command`, what the agent can do is up to the command, and `--explore` is ignored.
 - **No agentic fixer or budget.** `--agentic-fix` needs Claude Code's permission rules to limit the agent to your `--check` commands, and `--budget` needs a cost figure, which only Claude Code reports. Token counts still appear in the report where the harness reports them.
-- **Project files.** Codex is run with `AGENTS.md` loading turned off, so a change can't rewrite its own instructions. Copilot is run with `--no-custom-instructions` for the same reason. Gemini CLI still loads `GEMINI.md` and project `.gemini/` settings from the repo, and a `command` agent loads whatever it loads, so with those, a change under review can affect its own review.
+- **Project files.** Codex is run with `AGENTS.md` loading turned off, and Copilot with `--no-custom-instructions`, so a change can't rewrite its own instructions. Your conventions in those files still apply, because reviewloop passes them as [project rules](#project-rules), read from `--base`. Gemini CLI still loads `GEMINI.md` and project `.gemini/` settings from the repo, and a `command` agent loads whatever it loads, so with those, a change under review can affect its own review.
 
 ## Custom reviewers
 

@@ -15,7 +15,15 @@ MAX_DENY_RULES = 1000
 MAX_RELATED_TEST_BYTES = 100_000
 TEST_PATH = re.compile(r"(^|/)(tests?|specs?|__tests__)/|(^|/)test_[^/]+$|_test\.[^/]+$|\.(test|spec)\.[^/]+$")
 GENERIC_STEMS = {"__init__", "__main__", "index", "main", "mod"}  # these names say nothing about what a test covers
-RULE_FILES = [".reviewloop/rules.md", "CLAUDE.md", "CONTRIBUTING.md"]  # most specific first
+# Most specific first: reviewloop's own, then each coding agent's instruction file, then the general guide.
+RULE_FILES = [
+    ".reviewloop/rules.md",
+    "CLAUDE.md",
+    "AGENTS.md",  # Codex, Copilot and others
+    ".github/copilot-instructions.md",
+    "GEMINI.md",
+    "CONTRIBUTING.md",
+]
 
 
 def git(repo: Path, *args: str) -> str:
@@ -96,7 +104,10 @@ def load_rules(repo: Path, base: str, changed: list[str]) -> tuple[dict[str, str
         if len(data) > MAX_RULES_BYTES:
             notes.append(f"{rel} is over {MAX_RULES_BYTES:,} bytes, so only the start was loaded")
         text = data[:MAX_RULES_BYTES].decode("utf-8", errors="replace").strip()
-        if text:
+        same = next((other for other, loaded in rules.items() if loaded == text), None)
+        if same:  # teams often keep CLAUDE.md and AGENTS.md as copies
+            notes.append(f"{rel} is the same as {same}, so it wasn't loaded twice")
+        elif text:
             rules[rel] = text
     return rules, notes
 
