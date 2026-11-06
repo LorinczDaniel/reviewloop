@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 from . import context, report
-from .llm import DEFAULT_MODEL, ApiLLM, ClaudeCodeLLM, CodexLLM, CommandLLM, GeminiLLM, LLMError, Usage
+from .llm import DEFAULT_MODEL, ApiLLM, ClaudeCodeLLM, CodexLLM, CommandLLM, CopilotLLM, GeminiLLM, LLMError, Usage
 from .loop import Config, ReviewLoop, load_reviewers
 from .schemas import SEVERITIES
 
@@ -16,7 +16,7 @@ FAST_MODEL = "claude-sonnet-5-5"
 EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 DEFAULT_REVIEWER_MODELS = {"readability": (FAST_MODEL, "medium")}  # style rarely needs the top model at high effort
 CLAUDE_BACKENDS = {"claude-code", "api"}  # where the Claude model defaults apply
-BACKENDS = ["claude-code", "api", "codex", "gemini", "command"]
+BACKENDS = ["claude-code", "api", "codex", "gemini", "copilot", "command"]
 EXIT = {"approved": 0, "nothing_to_review": 0, "report_only": 0, "not_converged": 1, "triage_aborted": 1, "over_budget": 1}
 
 
@@ -47,6 +47,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--backend", choices=BACKENDS, default="claude-code",
                    help="claude-code: run `claude -p` on your Claude Code login (default); api: Anthropic API, needs "
                         "ANTHROPIC_API_KEY; codex: OpenAI Codex CLI (`codex exec`); gemini: Gemini CLI (`gemini -p`); "
+                        "copilot: GitHub Copilot CLI (`copilot -p`); "
                         "command: any command given with --agent-cmd")
     p.add_argument("--agent-cmd", metavar="CMD",
                    help="with --backend command: the command to run for each agent call. It gets the prompt on stdin "
@@ -54,7 +55,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--explore", action="store_true",
                    help="let reviewers read/grep the rest of the repo for context (claude-code backend only; slower)")
     p.add_argument("--model", help=f"model (default: {DEFAULT_MODEL}, or {FAST_MODEL} with --fast; "
-                                   "with codex, gemini or command, the harness's own default)")
+                                   "with other backends, the harness's own default)")
     p.add_argument("--effort", choices=EFFORTS,
                    help="reasoning effort (default: high, or medium with --fast)")
     p.add_argument("--fast", action="store_true",
@@ -178,6 +179,8 @@ def main(argv=None) -> int:
                 return CodexLLM(model=model, effort=effort, cwd=repo, usage=usage)
             case "gemini":
                 return GeminiLLM(model=model, effort=effort, cwd=repo, usage=usage)
+            case "copilot":
+                return CopilotLLM(model=model, effort=effort, cwd=repo, usage=usage)
             case _:
                 return CommandLLM(model=model, effort=effort, cwd=repo, usage=usage, command=args.agent_cmd)
 
@@ -189,7 +192,7 @@ def main(argv=None) -> int:
         return 2
     if args.explore and args.backend in ("api", "command"):
         print(f"warning: --explore doesn't work with --backend {args.backend}; ignoring", file=sys.stderr)
-    elif args.backend in ("codex", "gemini") and not args.explore:
+    elif args.backend in ("codex", "gemini", "copilot") and not args.explore:
         print(f"note: {args.backend} agents can always read the repo (read-only), as if --explore were on", file=sys.stderr)
     print(f"Model: {model or 'harness default'} (effort {effort}) via {args.backend}")
     for name, (reviewer_model, reviewer_effort) in sorted(per_reviewer.items()):

@@ -1,6 +1,6 @@
 # reviewloop
 
-Multi-reviewer code review loop powered by Claude, or by another coding agent such as Codex or Gemini CLI. Specialist reviewers (safety, security, readability, tests) review your diff in parallel. An overseer decides what to do with each finding, and a fixer applies the changes. The loop repeats until no blocking findings remain and your checks pass, or until it hits the round limit and hands off to you.
+Multi-reviewer code review loop powered by Claude, or by another coding agent such as Codex, Gemini CLI or GitHub Copilot CLI. Specialist reviewers (safety, security, readability, tests) review your diff in parallel. An overseer decides what to do with each finding, and a fixer applies the changes. The loop repeats until no blocking findings remain and your checks pass, or until it hits the round limit and hands off to you.
 
 ```
 round N:  safety ─┐
@@ -82,7 +82,7 @@ By default each agent is a headless `claude -p` call on your Claude Code login, 
 | `--explore` | off | Reviewers can read and grep the whole repo, not just the diff. Slower, but catches issues in surrounding code |
 | `--reviewers LIST` | all | Run only some reviewers, e.g. `safety,security` |
 | `--reviewer-dir DIR` | none | Add your own reviewers (see below) |
-| `--backend` | `claude-code` | `claude-code`, `api`, `codex`, `gemini` or `command`. See [Other harnesses](#other-harnesses) |
+| `--backend` | `claude-code` | `claude-code`, `api`, `codex`, `gemini`, `copilot` or `command`. See [Other harnesses](#other-harnesses) |
 | `--agent-cmd CMD` | none | With `--backend command`: the command to run for each agent call |
 | `--repo PATH` | current directory | Repository to review |
 | `--out DIR` | `<repo>/.reviewloop` | Where reports and backups go |
@@ -195,6 +195,7 @@ Every agent call is one prompt in and one JSON object out, so reviewloop can run
 | `api` | Anthropic API | Needs `ANTHROPIC_API_KEY`. No `--explore`, `--agentic-fix` or `--budget` |
 | `codex` | `codex exec` ([OpenAI Codex CLI](https://github.com/openai/codex)) | Read-only sandbox. Replies are constrained with `--output-schema`. `--effort max` becomes `xhigh` |
 | `gemini` | `gemini -p` ([Gemini CLI](https://github.com/google-gemini/gemini-cli)) | Plan (read-only) approval mode. `--effort` has no effect |
+| `copilot` | `copilot -p` ([GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/use-copilot-cli)) | Only its read tool is available. `--effort` has no effect, and no token counts are reported. The prompt is passed as an argument, so a call whose prompt is over 120 KB fails; use `--reviewers` or a smaller diff |
 | `command` | whatever `--agent-cmd` says | See below |
 
 Install and log in to the harness first; reviewloop uses its login, and its own config, the same way it uses Claude Code's.
@@ -215,9 +216,9 @@ What's different from `claude-code`:
 
 - **Models.** Without `--model`, each harness uses its own default model, and every agent uses it: the Sonnet default for the readability reviewer only applies to `claude-code` and `api`. `--fast` only lowers the effort to medium.
 - **Replies are checked.** Except with Codex, the harness can't enforce the JSON shape, so the prompt asks for it, and the reply is checked here. A reply that doesn't fit counts as that agent failing, like any other error.
-- **Reviewers can read the repo.** Codex and Gemini always have their read-only file tools, so reviewers behave as if `--explore` were on. They can't edit files or run commands that change anything. With `command`, what the agent can do is up to the command, and `--explore` is ignored.
+- **Reviewers can read the repo.** Codex, Gemini and Copilot always have their read-only file tools, so reviewers behave as if `--explore` were on. They can't edit files or run commands that change anything. With `command`, what the agent can do is up to the command, and `--explore` is ignored.
 - **No agentic fixer or budget.** `--agentic-fix` needs Claude Code's permission rules to limit the agent to your `--check` commands, and `--budget` needs a cost figure, which only Claude Code reports. Token counts still appear in the report where the harness reports them.
-- **Project files.** Codex is run with `AGENTS.md` loading turned off, so a change can't rewrite its own instructions. Gemini CLI still loads `GEMINI.md` and project `.gemini/` settings from the repo, and a `command` agent loads whatever it loads, so with those, a change under review can affect its own review.
+- **Project files.** Codex is run with `AGENTS.md` loading turned off, so a change can't rewrite its own instructions. Gemini CLI still loads `GEMINI.md` and project `.gemini/` settings from the repo, Copilot CLI still loads its custom instructions (such as `.github/copilot-instructions.md` and `AGENTS.md`), and a `command` agent loads whatever it loads, so with those, a change under review can affect its own review.
 
 ## Custom reviewers
 

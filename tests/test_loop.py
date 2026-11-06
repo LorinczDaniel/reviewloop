@@ -1838,14 +1838,32 @@ def test_command_backend_failure_is_an_error(monkeypatch):
         llm_module.CommandLLM(command="my-agent").structured("s", "u", REVIEW_SCHEMA)
 
 
-@pytest.mark.parametrize("cls", [llm_module.CodexLLM, llm_module.GeminiLLM])
+def test_copilot_backend_passes_the_prompt_and_allows_only_reading(monkeypatch):
+    calls = _fake_harness(monkeypatch, lambda cmd, _: ("Here:\n```json\n" + json.dumps(REVIEW_REPLY) + "\n```", 0))
+    assert llm_module.CopilotLLM(model="gpt-x").structured("SYSTEM", "USER", REVIEW_SCHEMA) == REVIEW_REPLY
+    cmd = calls[0]["cmd"]
+    prompt = cmd[cmd.index("--prompt") + 1]
+    assert "SYSTEM" in prompt and "USER" in prompt
+    assert {"--silent", "--no-ask-user", "--available-tools=read", "--allow-tool=read"} <= set(cmd)
+    assert not any("allow-all" in a for a in cmd)
+    assert cmd[cmd.index("--model") + 1] == "gpt-x"
+
+
+def test_copilot_backend_refuses_a_prompt_too_long_for_an_argument(monkeypatch):
+    calls = _fake_harness(monkeypatch, lambda cmd, _: ("", 0))
+    with pytest.raises(llm_module.LLMError, match="over the"):
+        llm_module.CopilotLLM().structured("s", "x" * llm_module.COPILOT_MAX_PROMPT_BYTES, REVIEW_SCHEMA)
+    assert calls == []
+
+
+@pytest.mark.parametrize("cls", [llm_module.CodexLLM, llm_module.GeminiLLM, llm_module.CopilotLLM])
 def test_other_harnesses_refuse_the_agentic_fixer(monkeypatch, cls):
     _fake_harness(monkeypatch, lambda cmd, _: ("", 0))
     with pytest.raises(llm_module.LLMError, match="claude-code"):
         cls().agent("s", "u", {}, [], [])
 
 
-@pytest.mark.parametrize("backend", ["codex", "gemini", "command"])
+@pytest.mark.parametrize("backend", ["codex", "gemini", "copilot", "command"])
 def test_cli_other_harness_uses_its_own_default_model_everywhere(repo, monkeypatch, backend):
     made = []
 
@@ -1855,7 +1873,7 @@ def test_cli_other_harness_uses_its_own_default_model_everywhere(repo, monkeypat
             made.append(kw)
             self.usage = kw["usage"]
 
-    monkeypatch.setattr(cli, {"codex": "CodexLLM", "gemini": "GeminiLLM", "command": "CommandLLM"}[backend], Recording)
+    monkeypatch.setattr(cli, {"codex": "CodexLLM", "gemini": "GeminiLLM", "copilot": "CopilotLLM", "command": "CommandLLM"}[backend], Recording)
     extra = ["--agent-cmd", "my-agent"] if backend == "command" else []
     assert cli.main(["--repo", str(repo), "-y", "--backend", backend, *extra]) == 0
     assert [kw["model"] for kw in made] == [None]  # no Sonnet split for readability either
